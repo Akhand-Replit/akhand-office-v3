@@ -1,3 +1,2327 @@
+
+
+import streamlit as st
+import datetime
+import time
+from datetime import timedelta
+import io
+from sqlalchemy import create_engine, text
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from io import BytesIO
+
+#########################################
+# DATABASE CONNECTION
+#########################################
+
+@st.cache_resource
+def init_connection():
+    """Initialize database connection with caching.
+    
+    Returns:
+        SQLAlchemy engine or None if connection fails
+    """
+    try:
+        return create_engine(st.secrets["postgres"]["url"])
+    except Exception as e:
+        st.error(f"Database connection error: {e}")
+        return None
+
+def init_db(engine):
+    """Initialize database tables if they don't exist.
+    
+    Args:
+        engine: SQLAlchemy database engine
+    """
+    with engine.connect() as conn:
+        conn.execute(text('''
+        -- Companies table
+        CREATE TABLE IF NOT EXISTS companies (
+            id SERIAL PRIMARY KEY,
+            company_name VARCHAR(100) UNIQUE NOT NULL,
+            username VARCHAR(50) UNIQUE NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            profile_pic_url TEXT,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        -- Branches table (with parent branch support)
+        CREATE TABLE IF NOT EXISTS branches (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER REFERENCES companies(id),
+            parent_branch_id INTEGER REFERENCES branches(id),
+            branch_name VARCHAR(100) NOT NULL,
+            is_main_branch BOOLEAN DEFAULT FALSE,
+            location VARCHAR(255),
+            branch_head VARCHAR(100),
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(company_id, branch_name)
+        );
+        
+        -- Employee Roles table
+        CREATE TABLE IF NOT EXISTS employee_roles (
+            id SERIAL PRIMARY KEY,
+            role_name VARCHAR(50) NOT NULL,
+            role_level INTEGER NOT NULL,
+            company_id INTEGER REFERENCES companies(id),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(company_id, role_name)
+        );
+        
+        -- Messages table
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            sender_type VARCHAR(20) NOT NULL, -- 'admin' or 'company'
+            sender_id INTEGER NOT NULL,
+            receiver_type VARCHAR(20) NOT NULL, -- 'admin' or 'company'
+            receiver_id INTEGER NOT NULL,
+            message_text TEXT NOT NULL,
+            is_read BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        -- Employees table (now with roles)
+        CREATE TABLE IF NOT EXISTS employees (
+            id SERIAL PRIMARY KEY,
+            branch_id INTEGER REFERENCES branches(id),
+            role_id INTEGER REFERENCES employee_roles(id),
+            username VARCHAR(50) UNIQUE NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            full_name VARCHAR(100) NOT NULL,
+            profile_pic_url TEXT,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        -- Tasks table (updated for branch assignment)
+        CREATE TABLE IF NOT EXISTS tasks (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER REFERENCES companies(id),
+            branch_id INTEGER REFERENCES branches(id),
+            employee_id INTEGER REFERENCES employees(id),
+            task_description TEXT NOT NULL,
+            due_date DATE,
+            is_completed BOOLEAN DEFAULT FALSE,
+            completed_by_id INTEGER REFERENCES employees(id),
+            completed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        -- Task Assignments for tracking branch-level task completions
+        CREATE TABLE IF NOT EXISTS task_assignments (
+            id SERIAL PRIMARY KEY,
+            task_id INTEGER REFERENCES tasks(id),
+            employee_id INTEGER REFERENCES employees(id),
+            is_completed BOOLEAN DEFAULT FALSE,
+            completed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(task_id, employee_id)
+        );
+        
+        -- Daily reports table (unchanged)
+        CREATE TABLE IF NOT EXISTS daily_reports (
+            id SERIAL PRIMARY KEY,
+            employee_id INTEGER REFERENCES employees(id),
+            report_date DATE NOT NULL,
+            report_text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        -- Insert default employee roles if they don't exist
+        INSERT INTO employee_roles (role_name, role_level, company_id)
+        SELECT 'Manager', 1, id FROM companies
+        WHERE NOT EXISTS (
+            SELECT 1 FROM employee_roles WHERE role_name = 'Manager' AND company_id = companies.id
+        );
+        
+        INSERT INTO employee_roles (role_name, role_level, company_id)
+        SELECT 'Asst. Manager', 2, id FROM companies
+        WHERE NOT EXISTS (
+            SELECT 1 FROM employee_roles WHERE role_name = 'Asst. Manager' AND company_id = companies.id
+        );
+        
+        INSERT INTO employee_roles (role_name, role_level, company_id)
+        SELECT 'General Employee', 3, id FROM companies
+        WHERE NOT EXISTS (
+            SELECT 1 FROM employee_roles WHERE role_name = 'General Employee' AND company_id = companies.id
+        );
+        
+        -- Set existing employees to General Employee role by default
+        UPDATE employees e
+        SET role_id = r.id
+        FROM employee_roles r
+        JOIN branches b ON r.company_id = b.company_id
+        WHERE e.branch_id = b.id AND r.role_name = 'General Employee' AND e.role_id IS NULL;
+        '''))
+        conn.commit()
+
+#########################################
+# DATA MODELS
+#########################################
+
+class CompanyModel:
+    """Company data operations"""
+    
+    @staticmethod
+    def get_all_companies(conn):
+        """Get all companies from the database."""
+        result = conn.execute(text('''
+        SELECT id, company_name, username, profile_pic_url, is_active, created_at 
+        FROM companies
+        ORDER BY company_name
+        '''))
+        return result.fetchall()
+    
+    @staticmethod
+    def get_active_companies(conn):
+        """Get all active companies."""
+        result = conn.execute(text('''
+        SELECT id, company_name FROM companies 
+        WHERE is_active = TRUE
+        ORDER BY company_name
+        '''))
+        return result.fetchall()
+    
+    @staticmethod
+    def get_company_by_id(conn, company_id):
+        """Get company data by ID."""
+        result = conn.execute(text('''
+        SELECT company_name, username, profile_pic_url, is_active
+        FROM companies
+        WHERE id = :company_id
+        '''), {'company_id': company_id})
+        return result.fetchone()
+    
+    @staticmethod
+    def add_company(conn, company_name, username, password, profile_pic_url):
+        """Add a new company to the database."""
+        default_pic = "https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y"
+        
+        conn.execute(text('''
+        INSERT INTO companies (company_name, username, password, profile_pic_url, is_active)
+        VALUES (:company_name, :username, :password, :profile_pic_url, TRUE)
+        '''), {
+            'company_name': company_name,
+            'username': username,
+            'password': password,
+            'profile_pic_url': profile_pic_url if profile_pic_url else default_pic
+        })
+        conn.commit()
+    
+    @staticmethod
+    def update_company_status(conn, company_id, is_active):
+        """Activate or deactivate a company and all its branches and employees."""
+        # Update company status
+        conn.execute(text('UPDATE companies SET is_active = :is_active WHERE id = :id'), 
+                    {'id': company_id, 'is_active': is_active})
+        
+        # Update all branches for this company
+        conn.execute(text('''
+        UPDATE branches 
+        SET is_active = :is_active 
+        WHERE company_id = :company_id
+        '''), {'company_id': company_id, 'is_active': is_active})
+        
+        # Update all employees in all branches of this company
+        conn.execute(text('''
+        UPDATE employees 
+        SET is_active = :is_active 
+        WHERE branch_id IN (SELECT id FROM branches WHERE company_id = :company_id)
+        '''), {'company_id': company_id, 'is_active': is_active})
+        
+        conn.commit()
+    
+    @staticmethod
+    def reset_password(conn, company_id, new_password):
+        """Reset a company's password."""
+        conn.execute(text('UPDATE companies SET password = :password WHERE id = :id'), 
+                    {'id': company_id, 'password': new_password})
+        conn.commit()
+    
+    @staticmethod
+    def update_profile(conn, company_id, company_name, profile_pic_url):
+        """Update company profile information."""
+        conn.execute(text('''
+        UPDATE companies
+        SET company_name = :company_name, profile_pic_url = :profile_pic_url
+        WHERE id = :company_id
+        '''), {
+            'company_name': company_name,
+            'profile_pic_url': profile_pic_url,
+            'company_id': company_id
+        })
+        conn.commit()
+    
+    @staticmethod
+    def verify_password(conn, company_id, current_password):
+        """Verify company's current password."""
+        result = conn.execute(text('''
+        SELECT COUNT(*)
+        FROM companies
+        WHERE id = :company_id AND password = :current_password
+        '''), {'company_id': company_id, 'current_password': current_password})
+        return result.fetchone()[0] > 0
+
+
+class BranchModel:
+    """Branch data operations"""
+    
+    @staticmethod
+    def get_all_branches(conn):
+        """Get all branches with company information."""
+        result = conn.execute(text('''
+        SELECT b.id, b.branch_name, b.location, b.branch_head, b.is_active, 
+               c.company_name, c.id as company_id, b.is_main_branch,
+               p.branch_name as parent_branch_name, p.id as parent_branch_id
+        FROM branches b
+        JOIN companies c ON b.company_id = c.id
+        LEFT JOIN branches p ON b.parent_branch_id = p.id
+        ORDER BY c.company_name, b.is_main_branch DESC, b.branch_name
+        '''))
+        return result.fetchall()
+    
+    @staticmethod
+    def get_company_branches(conn, company_id):
+        """Get all branches for a specific company."""
+        result = conn.execute(text('''
+        SELECT b.id, b.branch_name, b.location, b.branch_head, b.is_active,
+               b.is_main_branch, b.parent_branch_id,
+               p.branch_name as parent_branch_name
+        FROM branches b
+        LEFT JOIN branches p ON b.parent_branch_id = p.id
+        WHERE b.company_id = :company_id
+        ORDER BY b.is_main_branch DESC, b.branch_name
+        '''), {'company_id': company_id})
+        return result.fetchall()
+    
+    @staticmethod
+    def get_branch_by_id(conn, branch_id):
+        """Get branch details by ID."""
+        result = conn.execute(text('''
+        SELECT b.id, b.branch_name, b.location, b.branch_head, b.is_active,
+               b.is_main_branch, b.parent_branch_id, b.company_id,
+               p.branch_name as parent_branch_name
+        FROM branches b
+        LEFT JOIN branches p ON b.parent_branch_id = p.id
+        WHERE b.id = :branch_id
+        '''), {'branch_id': branch_id})
+        return result.fetchone()
+    
+    @staticmethod
+    def get_parent_branches(conn, company_id, exclude_branch_id=None):
+        """Get all possible parent branches for a company (for creating sub-branches)."""
+        query = '''
+        SELECT id, branch_name 
+        FROM branches
+        WHERE company_id = :company_id AND is_active = TRUE
+        '''
+        
+        params = {'company_id': company_id}
+        
+        if exclude_branch_id:
+            query += ' AND id != :exclude_branch_id'
+            params['exclude_branch_id'] = exclude_branch_id
+        
+        query += ' ORDER BY is_main_branch DESC, branch_name'
+        
+        result = conn.execute(text(query), params)
+        return result.fetchall()
+    
+    @staticmethod
+    def get_active_branches(conn, company_id=None):
+        """Get all active branches, optionally filtered by company."""
+        query = '''
+        SELECT b.id, b.branch_name, c.company_name
+        FROM branches b
+        JOIN companies c ON b.company_id = c.id
+        WHERE b.is_active = TRUE AND c.is_active = TRUE
+        '''
+        
+        params = {}
+        if company_id:
+            query += ' AND b.company_id = :company_id'
+            params = {'company_id': company_id}
+        
+        query += ' ORDER BY c.company_name, b.is_main_branch DESC, b.branch_name'
+        
+        result = conn.execute(text(query), params)
+        return result.fetchall()
+    
+    @staticmethod
+    def create_main_branch(conn, company_id, branch_name, location, branch_head):
+        """Create a main branch for a company."""
+        conn.execute(text('''
+        INSERT INTO branches (company_id, branch_name, location, branch_head, is_main_branch, parent_branch_id, is_active)
+        VALUES (:company_id, :branch_name, :location, :branch_head, TRUE, NULL, TRUE)
+        '''), {
+            'company_id': company_id,
+            'branch_name': branch_name,
+            'location': location,
+            'branch_head': branch_head
+        })
+        conn.commit()
+    
+    @staticmethod
+    def create_sub_branch(conn, company_id, parent_branch_id, branch_name, location, branch_head):
+        """Create a sub-branch under a parent branch."""
+        conn.execute(text('''
+        INSERT INTO branches (company_id, parent_branch_id, branch_name, location, branch_head, is_main_branch, is_active)
+        VALUES (:company_id, :parent_branch_id, :branch_name, :location, :branch_head, FALSE, TRUE)
+        '''), {
+            'company_id': company_id,
+            'parent_branch_id': parent_branch_id,
+            'branch_name': branch_name,
+            'location': location,
+            'branch_head': branch_head
+        })
+        conn.commit()
+    
+    @staticmethod
+    def update_branch(conn, branch_id, branch_name, location, branch_head, parent_branch_id=None):
+        """Update branch details."""
+        query = '''
+        UPDATE branches 
+        SET branch_name = :branch_name, location = :location, branch_head = :branch_head
+        '''
+        
+        params = {
+            'branch_id': branch_id,
+            'branch_name': branch_name,
+            'location': location,
+            'branch_head': branch_head
+        }
+        
+        # Only update parent_branch_id if provided and branch is not a main branch
+        if parent_branch_id is not None:
+            result = conn.execute(text('SELECT is_main_branch FROM branches WHERE id = :branch_id'), 
+                                 {'branch_id': branch_id})
+            is_main_branch = result.fetchone()[0]
+            
+            if not is_main_branch:
+                query += ', parent_branch_id = :parent_branch_id'
+                params['parent_branch_id'] = parent_branch_id
+        
+        query += ' WHERE id = :branch_id'
+        
+        conn.execute(text(query), params)
+        conn.commit()
+    
+    @staticmethod
+    def update_branch_status(conn, branch_id, is_active):
+        """Update branch active status and update related employees status too."""
+        with conn.begin():
+            # Update branch status
+            conn.execute(text('''
+            UPDATE branches 
+            SET is_active = :is_active
+            WHERE id = :branch_id
+            '''), {'branch_id': branch_id, 'is_active': is_active})
+            
+            # Update employees in this branch
+            conn.execute(text('''
+            UPDATE employees 
+            SET is_active = :is_active
+            WHERE branch_id = :branch_id
+            '''), {'branch_id': branch_id, 'is_active': is_active})
+        
+    @staticmethod
+    def get_branch_employees(conn, branch_id):
+        """Get all employees for a specific branch."""
+        result = conn.execute(text('''
+        SELECT e.id, e.username, e.full_name, e.profile_pic_url, e.is_active, r.role_name, r.role_level
+        FROM employees e
+        JOIN employee_roles r ON e.role_id = r.id
+        WHERE e.branch_id = :branch_id
+        ORDER BY r.role_level, e.full_name
+        '''), {'branch_id': branch_id})
+        return result.fetchall()
+    
+    @staticmethod
+    def get_employee_count_by_branch(conn, company_id):
+        """Get employee count for each branch of a company."""
+        result = conn.execute(text('''
+        SELECT b.id, b.branch_name, COUNT(e.id) as employee_count
+        FROM branches b
+        LEFT JOIN employees e ON b.id = e.branch_id AND e.is_active = TRUE
+        WHERE b.company_id = :company_id
+        GROUP BY b.id, b.branch_name
+        ORDER BY b.is_main_branch DESC, b.branch_name
+        '''), {'company_id': company_id})
+        return result.fetchall()
+    
+    @staticmethod
+    def get_subbranches(conn, parent_branch_id):
+        """Get all sub-branches of a branch."""
+        result = conn.execute(text('''
+        SELECT id, branch_name, is_active
+        FROM branches
+        WHERE parent_branch_id = :parent_branch_id
+        ORDER BY branch_name
+        '''), {'parent_branch_id': parent_branch_id})
+        return result.fetchall()
+
+
+class EmployeeModel:
+    """Employee data operations"""
+    
+    @staticmethod
+    def get_all_employees(conn, company_id=None):
+        """Get all employees with optional company filter.
+        
+        Args:
+            conn: Database connection
+            company_id: Optional company ID filter
+            
+        Returns:
+            List of employees with branch and role info
+        """
+        query = '''
+        SELECT e.id, e.username, e.full_name, e.profile_pic_url, e.is_active,
+               b.branch_name, c.company_name, r.role_name, r.role_level, b.id as branch_id
+        FROM employees e
+        JOIN branches b ON e.branch_id = b.id
+        JOIN companies c ON b.company_id = c.id
+        JOIN employee_roles r ON e.role_id = r.id
+        '''
+        
+        params = {}
+        if company_id:
+            query += ' WHERE b.company_id = :company_id'
+            params = {'company_id': company_id}
+        
+        query += ' ORDER BY c.company_name, b.branch_name, r.role_level, e.full_name'
+        
+        result = conn.execute(text(query), params)
+        return result.fetchall()
+    
+    @staticmethod
+    def get_branch_employees(conn, branch_id):
+        """Get all employees for a specific branch.
+        
+        Args:
+            conn: Database connection
+            branch_id: ID of the branch
+            
+        Returns:
+            List of employees with role info
+        """
+        result = conn.execute(text('''
+        SELECT e.id, e.username, e.full_name, e.profile_pic_url, e.is_active, 
+               r.role_name, r.role_level, r.id as role_id
+        FROM employees e
+        JOIN employee_roles r ON e.role_id = r.id
+        WHERE e.branch_id = :branch_id
+        ORDER BY r.role_level, e.full_name
+        '''), {'branch_id': branch_id})
+        return result.fetchall()
+    
+    @staticmethod
+    def get_active_employees(conn, company_id=None, branch_id=None, role_level=None):
+        """Get active employees with optional filters.
+        
+        Args:
+            conn: Database connection
+            company_id: Optional company ID filter
+            branch_id: Optional branch ID filter
+            role_level: Optional role level filter
+            
+        Returns:
+            List of active employees
+        """
+        query = '''
+        SELECT e.id, e.full_name, b.branch_name, c.company_name, r.role_name
+        FROM employees e
+        JOIN branches b ON e.branch_id = b.id
+        JOIN companies c ON b.company_id = c.id
+        JOIN employee_roles r ON e.role_id = r.id
+        WHERE e.is_active = TRUE 
+          AND b.is_active = TRUE
+          AND c.is_active = TRUE
+        '''
+        
+        params = {}
+        
+        if company_id:
+            query += ' AND c.id = :company_id'
+            params['company_id'] = company_id
+        
+        if branch_id:
+            query += ' AND b.id = :branch_id'
+            params['branch_id'] = branch_id
+        
+        if role_level:
+            query += ' AND r.role_level = :role_level'
+            params['role_level'] = role_level
+        
+        query += ' ORDER BY b.branch_name, r.role_level, e.full_name'
+        
+        result = conn.execute(text(query), params)
+        return result.fetchall()
+    
+    @staticmethod
+    def get_employee_by_id(conn, employee_id):
+        """Get detailed employee data by ID.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            
+        Returns:
+            Employee details including branch and role info
+        """
+        result = conn.execute(text('''
+        SELECT e.id, e.username, e.full_name, e.profile_pic_url, e.is_active,
+               b.id as branch_id, b.branch_name, r.id as role_id, r.role_name, 
+               c.id as company_id
+        FROM employees e
+        JOIN branches b ON e.branch_id = b.id
+        JOIN employee_roles r ON e.role_id = r.id
+        JOIN companies c ON b.company_id = c.id
+        WHERE e.id = :employee_id
+        '''), {'employee_id': employee_id})
+        return result.fetchone()
+    
+    @staticmethod
+    def add_employee(conn, branch_id, role_id, username, password, full_name, profile_pic_url):
+        """Add a new employee.
+        
+        Args:
+            conn: Database connection
+            branch_id: ID of the branch
+            role_id: ID of the role
+            username: Username for login
+            password: Password for login
+            full_name: Full name of employee
+            profile_pic_url: URL to profile picture
+        """
+        default_pic = "https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y"
+        
+        conn.execute(text('''
+        INSERT INTO employees (branch_id, role_id, username, password, full_name, profile_pic_url, is_active)
+        VALUES (:branch_id, :role_id, :username, :password, :full_name, :profile_pic_url, TRUE)
+        '''), {
+            'branch_id': branch_id,
+            'role_id': role_id,
+            'username': username,
+            'password': password,
+            'full_name': full_name,
+            'profile_pic_url': profile_pic_url if profile_pic_url else default_pic
+        })
+        conn.commit()
+    
+    @staticmethod
+    def update_employee_status(conn, employee_id, is_active):
+        """Activate or deactivate an employee.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            is_active: New active status
+        """
+        conn.execute(text('UPDATE employees SET is_active = :is_active WHERE id = :id'), 
+                    {'id': employee_id, 'is_active': is_active})
+        conn.commit()
+    
+    @staticmethod
+    def update_employee_role(conn, employee_id, role_id):
+        """Update employee's role.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            role_id: New role ID
+        """
+        conn.execute(text('''
+        UPDATE employees
+        SET role_id = :role_id
+        WHERE id = :employee_id
+        '''), {
+            'employee_id': employee_id,
+            'role_id': role_id
+        })
+        conn.commit()
+    
+    @staticmethod
+    def update_employee_branch(conn, employee_id, branch_id):
+        """Transfer employee to different branch.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            branch_id: New branch ID
+        """
+        conn.execute(text('''
+        UPDATE employees
+        SET branch_id = :branch_id
+        WHERE id = :employee_id
+        '''), {
+            'employee_id': employee_id,
+            'branch_id': branch_id
+        })
+        conn.commit()
+    
+    @staticmethod
+    def reset_password(conn, employee_id, new_password):
+        """Reset an employee's password.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            new_password: New password
+        """
+        conn.execute(text('UPDATE employees SET password = :password WHERE id = :id'), 
+                    {'id': employee_id, 'password': new_password})
+        conn.commit()
+    
+    @staticmethod
+    def update_profile(conn, employee_id, full_name, profile_pic_url):
+        """Update employee profile information.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            full_name: New full name
+            profile_pic_url: New profile picture URL
+        """
+        conn.execute(text('''
+        UPDATE employees
+        SET full_name = :full_name, profile_pic_url = :profile_pic_url
+        WHERE id = :employee_id
+        '''), {
+            'full_name': full_name,
+            'profile_pic_url': profile_pic_url,
+            'employee_id': employee_id
+        })
+        conn.commit()
+    
+    @staticmethod
+    def verify_password(conn, employee_id, current_password):
+        """Verify employee's current password.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            current_password: Password to verify
+            
+        Returns:
+            bool: True if password matches, False otherwise
+        """
+        result = conn.execute(text('''
+        SELECT COUNT(*)
+        FROM employees
+        WHERE id = :employee_id AND password = :current_password
+        '''), {'employee_id': employee_id, 'current_password': current_password})
+        return result.fetchone()[0] > 0
+    
+    @staticmethod
+    def update_password(conn, employee_id, new_password):
+        """Update an employee's password.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            new_password: New password
+        """
+        conn.execute(text('''
+        UPDATE employees
+        SET password = :new_password
+        WHERE id = :employee_id
+        '''), {
+            'employee_id': employee_id,
+            'new_password': new_password
+        })
+        conn.commit()
+
+
+class MessageModel:
+    """Message data operations"""
+    
+    @staticmethod
+    def send_message(conn, sender_type, sender_id, receiver_type, receiver_id, message_text):
+        """Send a new message."""
+        conn.execute(text('''
+        INSERT INTO messages 
+        (sender_type, sender_id, receiver_type, receiver_id, message_text, is_read)
+        VALUES (:sender_type, :sender_id, :receiver_type, :receiver_id, :message_text, FALSE)
+        '''), {
+            'sender_type': sender_type,
+            'sender_id': sender_id,
+            'receiver_type': receiver_type,
+            'receiver_id': receiver_id,
+            'message_text': message_text
+        })
+        conn.commit()
+    
+    @staticmethod
+    def mark_as_read(conn, message_id):
+        """Mark a message as read."""
+        conn.execute(text('UPDATE messages SET is_read = TRUE WHERE id = :id'), 
+                    {'id': message_id})
+        conn.commit()
+    
+    @staticmethod
+    def get_messages_for_admin(conn):
+        """Get all messages for admin."""
+        result = conn.execute(text('''
+        SELECT m.id, m.sender_type, m.sender_id, m.message_text, m.is_read, m.created_at,
+               CASE WHEN m.sender_type = 'company' THEN c.company_name ELSE 'Admin' END as sender_name
+        FROM messages m
+        LEFT JOIN companies c ON m.sender_type = 'company' AND m.sender_id = c.id
+        WHERE m.receiver_type = 'admin'
+        ORDER BY m.created_at DESC
+        '''))
+        return result.fetchall()
+    
+    @staticmethod
+    def get_messages_for_company(conn, company_id):
+        """Get all messages for a specific company."""
+        result = conn.execute(text('''
+        SELECT m.id, m.sender_type, m.sender_id, m.message_text, m.is_read, m.created_at,
+               CASE WHEN m.sender_type = 'admin' THEN 'Admin' ELSE c.company_name END as sender_name
+        FROM messages m
+        LEFT JOIN companies c ON m.sender_type = 'company' AND m.sender_id = c.id
+        WHERE (m.receiver_type = 'company' AND m.receiver_id = :company_id)
+           OR (m.sender_type = 'company' AND m.sender_id = :company_id)
+        ORDER BY m.created_at DESC
+        '''), {'company_id': company_id})
+        return result.fetchall()
+
+
+class RoleModel:
+    """Employee role data operations"""
+    
+    @staticmethod
+    def get_all_roles(conn, company_id):
+        """Get all roles for a company.
+        
+        Args:
+            conn: Database connection
+            company_id: ID of the company
+            
+        Returns:
+            List of roles (id, name, level)
+        """
+        result = conn.execute(text('''
+        SELECT id, role_name, role_level
+        FROM employee_roles
+        WHERE company_id = :company_id
+        ORDER BY role_level
+        '''), {'company_id': company_id})
+        return result.fetchall()
+    
+    @staticmethod
+    def get_role_by_id(conn, role_id):
+        """Get role details by ID.
+        
+        Args:
+            conn: Database connection
+            role_id: ID of the role
+            
+        Returns:
+            Role details (id, name, level, company_id)
+        """
+        result = conn.execute(text('''
+        SELECT id, role_name, role_level, company_id
+        FROM employee_roles
+        WHERE id = :role_id
+        '''), {'role_id': role_id})
+        return result.fetchone()
+    
+    @staticmethod
+    def create_role(conn, company_id, role_name, role_level):
+        """Create a new role.
+        
+        Args:
+            conn: Database connection
+            company_id: ID of the company
+            role_name: Name of the role
+            role_level: Level of the role (lower number = higher rank)
+        """
+        conn.execute(text('''
+        INSERT INTO employee_roles (company_id, role_name, role_level)
+        VALUES (:company_id, :role_name, :role_level)
+        '''), {
+            'company_id': company_id,
+            'role_name': role_name,
+            'role_level': role_level
+        })
+        conn.commit()
+    
+    @staticmethod
+    def update_role(conn, role_id, role_name, role_level):
+        """Update role details.
+        
+        Args:
+            conn: Database connection
+            role_id: ID of the role
+            role_name: New name for the role
+            role_level: New level for the role
+        """
+        conn.execute(text('''
+        UPDATE employee_roles
+        SET role_name = :role_name, role_level = :role_level
+        WHERE id = :role_id
+        '''), {
+            'role_id': role_id,
+            'role_name': role_name,
+            'role_level': role_level
+        })
+        conn.commit()
+    
+    @staticmethod
+    def delete_role(conn, role_id, replacement_role_id):
+        """Delete a role and reassign employees to another role.
+        
+        Args:
+            conn: Database connection
+            role_id: ID of the role to delete
+            replacement_role_id: ID of the role to assign employees to
+        """
+        with conn.begin():
+            # First reassign all employees with this role
+            conn.execute(text('''
+            UPDATE employees
+            SET role_id = :replacement_role_id
+            WHERE role_id = :role_id
+            '''), {
+                'role_id': role_id,
+                'replacement_role_id': replacement_role_id
+            })
+            
+            # Then delete the role
+            conn.execute(text('''
+            DELETE FROM employee_roles
+            WHERE id = :role_id
+            '''), {'role_id': role_id})
+    
+    @staticmethod
+    def get_manager_roles(conn, company_id):
+        """Get roles that are considered management (Manager and Asst. Manager).
+        
+        Args:
+            conn: Database connection
+            company_id: ID of the company
+            
+        Returns:
+            List of management role IDs
+        """
+        result = conn.execute(text('''
+        SELECT id 
+        FROM employee_roles
+        WHERE company_id = :company_id AND role_level <= 2
+        '''), {'company_id': company_id})
+        return [row[0] for row in result.fetchall()]
+    
+    @staticmethod
+    def initialize_default_roles(conn, company_id):
+        """Initialize default roles for a new company.
+        
+        Args:
+            conn: Database connection
+            company_id: ID of the company
+        """
+        # Check if roles already exist for this company
+        result = conn.execute(text('''
+        SELECT COUNT(*) FROM employee_roles WHERE company_id = :company_id
+        '''), {'company_id': company_id})
+        
+        if result.fetchone()[0] == 0:
+            # Create default roles
+            default_roles = [
+                ('Manager', 1),
+                ('Asst. Manager', 2),
+                ('General Employee', 3)
+            ]
+            
+            for role_name, role_level in default_roles:
+                conn.execute(text('''
+                INSERT INTO employee_roles (company_id, role_name, role_level)
+                VALUES (:company_id, :role_name, :role_level)
+                '''), {
+                    'company_id': company_id,
+                    'role_name': role_name,
+                    'role_level': role_level
+                })
+            
+            conn.commit()
+
+
+class ReportModel:
+    """Daily report data operations with advanced filtering"""
+    
+    @staticmethod
+    def get_employee_reports(conn, employee_id, start_date, end_date):
+        """Get reports for a specific employee within a date range.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            start_date: Start date for filtering
+            end_date: End date for filtering
+            
+        Returns:
+            List of reports
+        """
+        result = conn.execute(text('''
+        SELECT id, report_date, report_text
+        FROM daily_reports
+        WHERE employee_id = :employee_id
+        AND report_date BETWEEN :start_date AND :end_date
+        ORDER BY report_date DESC
+        '''), {'employee_id': employee_id, 'start_date': start_date, 'end_date': end_date})
+        return result.fetchall()
+    
+    @staticmethod
+    def get_branch_reports(conn, branch_id, start_date, end_date, role_id=None):
+        """Get reports for all employees in a branch within a date range.
+        
+        Args:
+            conn: Database connection
+            branch_id: ID of the branch
+            start_date: Start date for filtering
+            end_date: End date for filtering
+            role_id: Optional role ID for filtering
+            
+        Returns:
+            List of reports with employee info
+        """
+        query = '''
+        SELECT dr.id, e.full_name, r.role_name, dr.report_date, dr.report_text, dr.created_at
+        FROM daily_reports dr
+        JOIN employees e ON dr.employee_id = e.id
+        JOIN employee_roles r ON e.role_id = r.id
+        WHERE e.branch_id = :branch_id
+        AND dr.report_date BETWEEN :start_date AND :end_date
+        '''
+        
+        params = {
+            'branch_id': branch_id, 
+            'start_date': start_date, 
+            'end_date': end_date
+        }
+        
+        if role_id:
+            query += ' AND e.role_id = :role_id'
+            params['role_id'] = role_id
+        
+        query += ' ORDER BY dr.report_date DESC, r.role_level, e.full_name'
+        
+        result = conn.execute(text(query), params)
+        return result.fetchall()
+    
+    @staticmethod
+    def get_company_reports(conn, company_id, start_date, end_date, branch_id=None, role_id=None):
+        """Get reports for all employees in a company within a date range.
+        
+        Args:
+            conn: Database connection
+            company_id: ID of the company
+            start_date: Start date for filtering
+            end_date: End date for filtering
+            branch_id: Optional branch ID for filtering
+            role_id: Optional role ID for filtering
+            
+        Returns:
+            List of reports with employee and branch info
+        """
+        query = '''
+        SELECT dr.id, e.full_name, r.role_name, b.branch_name, dr.report_date, dr.report_text, dr.created_at
+        FROM daily_reports dr
+        JOIN employees e ON dr.employee_id = e.id
+        JOIN branches b ON e.branch_id = b.id
+        JOIN employee_roles r ON e.role_id = r.id
+        WHERE b.company_id = :company_id
+        AND dr.report_date BETWEEN :start_date AND :end_date
+        '''
+        
+        params = {
+            'company_id': company_id, 
+            'start_date': start_date, 
+            'end_date': end_date
+        }
+        
+        if branch_id:
+            query += ' AND e.branch_id = :branch_id'
+            params['branch_id'] = branch_id
+        
+        if role_id:
+            query += ' AND e.role_id = :role_id'
+            params['role_id'] = role_id
+        
+        query += ' ORDER BY dr.report_date DESC, b.branch_name, r.role_level, e.full_name'
+        
+        result = conn.execute(text(query), params)
+        return result.fetchall()
+    
+    @staticmethod
+    def get_all_reports(conn, start_date, end_date, employee_name=None):
+        """Get all reports with optional employee filter.
+        
+        Args:
+            conn: Database connection
+            start_date: Start date for filtering
+            end_date: End date for filtering
+            employee_name: Optional employee name filter
+            
+        Returns:
+            List of reports with employee info
+        """
+        query = '''
+        SELECT e.full_name, dr.report_date, dr.report_text, dr.id, e.id as employee_id
+        FROM daily_reports dr
+        JOIN employees e ON dr.employee_id = e.id
+        WHERE dr.report_date BETWEEN :start_date AND :end_date
+        '''
+        
+        params = {'start_date': start_date, 'end_date': end_date}
+        
+        if employee_name and employee_name != "All Employees":
+            query += ' AND e.full_name = :employee_name'
+            params['employee_name'] = employee_name
+        
+        query += ' ORDER BY dr.report_date DESC, e.full_name'
+        
+        result = conn.execute(text(query), params)
+        return result.fetchall()
+    
+    @staticmethod
+    def add_report(conn, employee_id, report_date, report_text):
+        """Add a new report.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            report_date: Date of the report
+            report_text: Content of the report
+        """
+        conn.execute(text('''
+        INSERT INTO daily_reports (employee_id, report_date, report_text)
+        VALUES (:employee_id, :report_date, :report_text)
+        '''), {
+            'employee_id': employee_id,
+            'report_date': report_date,
+            'report_text': report_text
+        })
+        conn.commit()
+    
+    @staticmethod
+    def update_report(conn, report_id, report_date, report_text):
+        """Update an existing report.
+        
+        Args:
+            conn: Database connection
+            report_id: ID of the report
+            report_date: New date for the report
+            report_text: New content for the report
+        """
+        conn.execute(text('''
+        UPDATE daily_reports 
+        SET report_text = :report_text, report_date = :report_date, created_at = CURRENT_TIMESTAMP
+        WHERE id = :id
+        '''), {
+            'report_text': report_text,
+            'report_date': report_date,
+            'id': report_id
+        })
+        conn.commit()
+    
+    @staticmethod
+    def check_report_exists(conn, employee_id, report_date):
+        """Check if a report already exists for the given date.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            report_date: Date to check
+            
+        Returns:
+            Report ID if exists, None otherwise
+        """
+        result = conn.execute(text('''
+        SELECT id FROM daily_reports 
+        WHERE employee_id = :employee_id AND report_date = :report_date
+        '''), {'employee_id': employee_id, 'report_date': report_date})
+        return result.fetchone()
+
+
+class TaskModel:
+    """Task data operations with branch and employee assignment support"""
+    
+    @staticmethod
+    def create_task(conn, company_id, task_description, due_date, branch_id=None, employee_id=None):
+        """Create a new task with branch or employee assignment.
+        
+        Args:
+            conn: Database connection
+            company_id: ID of the company creating the task
+            task_description: Description of the task
+            due_date: Due date for the task
+            branch_id: Optional branch ID for branch-level assignment
+            employee_id: Optional employee ID for direct assignment
+            
+        Returns:
+            int: ID of the created task
+        """
+        with conn.begin():
+            # Insert task record
+            result = conn.execute(text('''
+            INSERT INTO tasks (company_id, branch_id, employee_id, task_description, due_date, is_completed)
+            VALUES (:company_id, :branch_id, :employee_id, :task_description, :due_date, FALSE)
+            RETURNING id
+            '''), {
+                'company_id': company_id,
+                'branch_id': branch_id,
+                'employee_id': employee_id,
+                'task_description': task_description,
+                'due_date': due_date
+            })
+            
+            task_id = result.fetchone()[0]
+            
+            # If assigned to a branch, create assignments for all branch employees
+            if branch_id and not employee_id:
+                # Get all active employees in the branch
+                employees = conn.execute(text('''
+                SELECT id FROM employees
+                WHERE branch_id = :branch_id AND is_active = TRUE
+                '''), {'branch_id': branch_id}).fetchall()
+                
+                # Create task assignments for each employee
+                for emp in employees:
+                    conn.execute(text('''
+                    INSERT INTO task_assignments (task_id, employee_id, is_completed)
+                    VALUES (:task_id, :employee_id, FALSE)
+                    '''), {
+                        'task_id': task_id,
+                        'employee_id': emp[0]
+                    })
+            
+            return task_id
+    
+    @staticmethod
+    def get_tasks_for_company(conn, company_id, status_filter=None):
+        """Get all tasks for a company with optional status filter.
+        
+        Args:
+            conn: Database connection
+            company_id: ID of the company
+            status_filter: Optional status filter ('All', 'Pending', 'Completed')
+            
+        Returns:
+            List of tasks with branch and employee info
+        """
+        query = '''
+        SELECT t.id, t.task_description, t.due_date, t.is_completed, 
+               t.completed_at, t.created_at, t.branch_id, t.employee_id,
+               CASE 
+                   WHEN t.branch_id IS NOT NULL THEN b.branch_name 
+                   WHEN t.employee_id IS NOT NULL THEN e.full_name
+                   ELSE 'Unassigned'
+               END as assignee_name,
+               CASE
+                   WHEN t.branch_id IS NOT NULL THEN 'branch'
+                   WHEN t.employee_id IS NOT NULL THEN 'employee'
+                   ELSE 'unassigned'
+               END as assignee_type,
+               ce.full_name as completed_by_name
+        FROM tasks t
+        LEFT JOIN branches b ON t.branch_id = b.id
+        LEFT JOIN employees e ON t.employee_id = e.id
+        LEFT JOIN employees ce ON t.completed_by_id = ce.id
+        WHERE t.company_id = :company_id
+        '''
+        
+        params = {'company_id': company_id}
+        
+        if status_filter == "Pending":
+            query += ' AND t.is_completed = FALSE'
+        elif status_filter == "Completed":
+            query += ' AND t.is_completed = TRUE'
+        
+        query += ' ORDER BY t.due_date ASC NULLS LAST, t.created_at DESC'
+        
+        result = conn.execute(text(query), params)
+        return result.fetchall()
+    
+    @staticmethod
+    def get_branch_task_progress(conn, task_id):
+        """Get progress of a branch-level task.
+        
+        Args:
+            conn: Database connection
+            task_id: ID of the task
+            
+        Returns:
+            Dict with total, completed counts and employee completion status
+        """
+        # Get task information
+        task_info = conn.execute(text('''
+        SELECT branch_id FROM tasks WHERE id = :task_id
+        '''), {'task_id': task_id}).fetchone()
+        
+        if not task_info or not task_info[0]:
+            return None  # Not a branch task
+        
+        # Get completion counts
+        counts = conn.execute(text('''
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN is_completed THEN 1 ELSE 0 END) as completed
+        FROM task_assignments
+        WHERE task_id = :task_id
+        '''), {'task_id': task_id}).fetchone()
+        
+        # Get individual employee statuses
+        employee_statuses = conn.execute(text('''
+        SELECT ta.employee_id, e.full_name, ta.is_completed, r.role_name, r.role_level,
+               ta.completed_at
+        FROM task_assignments ta
+        JOIN employees e ON ta.employee_id = e.id
+        JOIN employee_roles r ON e.role_id = r.id
+        WHERE ta.task_id = :task_id
+        ORDER BY r.role_level, e.full_name
+        '''), {'task_id': task_id}).fetchall()
+        
+        return {
+            'total': counts[0],
+            'completed': counts[1],
+            'employee_statuses': employee_statuses
+        }
+    
+    @staticmethod
+    def mark_task_completed(conn, task_id, employee_id):
+        """Mark a task as completed by an employee.
+        
+        For branch tasks, this marks the employee's assignment as completed.
+        For individual tasks, this marks the entire task as completed.
+        
+        Args:
+            conn: Database connection
+            task_id: ID of the task
+            employee_id: ID of the employee completing the task
+            
+        Returns:
+            bool: True if entire task is now complete, False otherwise
+        """
+        now = datetime.datetime.now()
+        
+        with conn.begin():
+            # Get task information
+            task = conn.execute(text('''
+            SELECT branch_id, employee_id, is_completed 
+            FROM tasks 
+            WHERE id = :task_id
+            '''), {'task_id': task_id}).fetchone()
+            
+            if not task:
+                return False
+            
+            # If already completed, do nothing
+            if task[2]:
+                return True
+            
+            # If branch task, update the employee's assignment
+            if task[0]:  # branch_id is not None
+                # Update the assignment
+                conn.execute(text('''
+                UPDATE task_assignments
+                SET is_completed = TRUE, completed_at = :now
+                WHERE task_id = :task_id AND employee_id = :employee_id
+                '''), {
+                    'task_id': task_id,
+                    'employee_id': employee_id,
+                    'now': now
+                })
+                
+                # Check employee role level
+                employee_role = conn.execute(text('''
+                SELECT r.role_level 
+                FROM employees e
+                JOIN employee_roles r ON e.role_id = r.id
+                WHERE e.id = :employee_id
+                '''), {'employee_id': employee_id}).fetchone()
+                
+                is_manager = employee_role and employee_role[0] <= 2  # Manager or Asst. Manager
+                
+                # If employee is a manager or assistant manager, complete the entire task
+                if is_manager:
+                    conn.execute(text('''
+                    UPDATE tasks
+                    SET is_completed = TRUE, completed_at = :now, completed_by_id = :employee_id
+                    WHERE id = :task_id
+                    '''), {
+                        'task_id': task_id,
+                        'employee_id': employee_id,
+                        'now': now
+                    })
+                    return True
+                
+                # Otherwise, check if all assignments are complete
+                all_complete = conn.execute(text('''
+                SELECT COUNT(*) = 0
+                FROM task_assignments
+                WHERE task_id = :task_id AND is_completed = FALSE
+                '''), {'task_id': task_id}).fetchone()[0]
+                
+                if all_complete:
+                    conn.execute(text('''
+                    UPDATE tasks
+                    SET is_completed = TRUE, completed_at = :now, completed_by_id = :employee_id
+                    WHERE id = :task_id
+                    '''), {
+                        'task_id': task_id,
+                        'employee_id': employee_id,
+                        'now': now
+                    })
+                    return True
+                
+                return False
+                
+            # If direct employee task, complete it
+            elif task[1] == employee_id:  # task assigned directly to this employee
+                conn.execute(text('''
+                UPDATE tasks
+                SET is_completed = TRUE, completed_at = :now, completed_by_id = :employee_id
+                WHERE id = :task_id
+                '''), {
+                    'task_id': task_id,
+                    'employee_id': employee_id,
+                    'now': now
+                })
+                return True
+            
+            return False
+    
+    @staticmethod
+    def get_tasks_for_employee(conn, employee_id, status_filter=None):
+        """Get tasks assigned to an employee.
+        
+        Includes both direct tasks and branch-level tasks.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            status_filter: Optional status filter ('All', 'Pending', 'Completed')
+            
+        Returns:
+            List of tasks with type and completion status
+        """
+        # Get employee's branch
+        emp_info = conn.execute(text('''
+        SELECT branch_id FROM employees WHERE id = :employee_id
+        '''), {'employee_id': employee_id}).fetchone()
+        
+        if not emp_info:
+            return []
+        
+        branch_id = emp_info[0]
+        
+        # Get directly assigned tasks
+        direct_query = '''
+        SELECT t.id, t.task_description, t.due_date, t.is_completed, 
+               t.completed_at, t.created_at, 'direct' as task_type,
+               NULL as assignment_id, t.is_completed as assignment_completed
+        FROM tasks t
+        WHERE t.employee_id = :employee_id
+        '''
+        
+        if status_filter == "Pending":
+            direct_query += ' AND t.is_completed = FALSE'
+        elif status_filter == "Completed":
+            direct_query += ' AND t.is_completed = TRUE'
+        
+        # Get branch-level tasks
+        branch_query = '''
+        SELECT t.id, t.task_description, t.due_date, t.is_completed, 
+               t.completed_at, t.created_at, 'branch' as task_type,
+               ta.id as assignment_id, ta.is_completed as assignment_completed
+        FROM tasks t
+        JOIN task_assignments ta ON t.id = ta.task_id
+        WHERE t.branch_id = :branch_id AND ta.employee_id = :employee_id
+        '''
+        
+        if status_filter == "Pending":
+            branch_query += ' AND ta.is_completed = FALSE'
+        elif status_filter == "Completed":
+            branch_query += ' AND ta.is_completed = TRUE'
+        
+        # Combine queries
+        query = f'''
+        {direct_query}
+        UNION ALL
+        {branch_query}
+        ORDER BY due_date ASC NULLS LAST, created_at DESC
+        '''
+        
+        result = conn.execute(text(query), {
+            'employee_id': employee_id,
+            'branch_id': branch_id
+        })
+        
+        return result.fetchall()
+    
+    @staticmethod
+    def reopen_task(conn, task_id):
+        """Reopen a completed task.
+        
+        Args:
+            conn: Database connection
+            task_id: ID of the task
+        """
+        with conn.begin():
+            # First reopen the main task
+            conn.execute(text('''
+            UPDATE tasks
+            SET is_completed = FALSE, completed_at = NULL, completed_by_id = NULL
+            WHERE id = :task_id
+            '''), {'task_id': task_id})
+            
+            # Then reopen all assignments
+            conn.execute(text('''
+            UPDATE task_assignments
+            SET is_completed = FALSE, completed_at = NULL
+            WHERE task_id = :task_id
+            '''), {'task_id': task_id})
+    
+    @staticmethod
+    def delete_task(conn, task_id):
+        """Delete a task and all its assignments.
+        
+        Args:
+            conn: Database connection
+            task_id: ID of the task
+        """
+        with conn.begin():
+            # First delete all assignments
+            conn.execute(text('''
+            DELETE FROM task_assignments
+            WHERE task_id = :task_id
+            '''), {'task_id': task_id})
+            
+            # Then delete the task
+            conn.execute(text('''
+            DELETE FROM tasks
+            WHERE id = :task_id
+            '''), {'task_id': task_id})
+    
+    @staticmethod
+    def add_task(conn, employee_id, task_description, due_date):
+        """Add a new task directly to an employee.
+        
+        Args:
+            conn: Database connection
+            employee_id: ID of the employee
+            task_description: Description of the task
+            due_date: Due date for the task
+        """
+        conn.execute(text('''
+        INSERT INTO tasks (employee_id, task_description, due_date, is_completed)
+        VALUES (:employee_id, :task_description, :due_date, FALSE)
+        '''), {
+            'employee_id': employee_id,
+            'task_description': task_description,
+            'due_date': due_date
+        })
+        conn.commit()
+    
+    @staticmethod
+    def update_task_status(conn, task_id, is_completed):
+        """Update a task's completion status.
+        
+        Args:
+            conn: Database connection
+            task_id: ID of the task
+            is_completed: New completion status
+        """
+        conn.execute(text('''
+        UPDATE tasks SET is_completed = :is_completed WHERE id = :id
+        '''), {'id': task_id, 'is_completed': is_completed})
+        conn.commit()
+
+
+#########################################
+# UTILITY FUNCTIONS
+#########################################
+
+class RolePermissions:
+    """Define role-based permissions and access controls"""
+    
+    # Role level definitions (lower number = higher authority)
+    MANAGER = 1
+    ASST_MANAGER = 2
+    GENERAL_EMPLOYEE = 3
+    
+    @staticmethod
+    def get_role_level(role_name):
+        """Convert role name to role level."""
+        role_map = {
+            "Manager": RolePermissions.MANAGER,
+            "Asst. Manager": RolePermissions.ASST_MANAGER,
+            "General Employee": RolePermissions.GENERAL_EMPLOYEE
+        }
+        return role_map.get(role_name, RolePermissions.GENERAL_EMPLOYEE)
+    
+    @staticmethod
+    def get_role_name(role_level):
+        """Convert role level to role name."""
+        role_map = {
+            RolePermissions.MANAGER: "Manager",
+            RolePermissions.ASST_MANAGER: "Asst. Manager",
+            RolePermissions.GENERAL_EMPLOYEE: "General Employee"
+        }
+        return role_map.get(role_level, "General Employee")
+    
+    @staticmethod
+    def can_create_employees(user_role_level):
+        """Check if the role can create employee accounts."""
+        return user_role_level <= RolePermissions.ASST_MANAGER  # Manager and Asst. Manager can create
+    
+    @staticmethod
+    def can_assign_tasks_to(user_role_level, target_role_level):
+        """Check if user role can assign tasks to target role."""
+        if user_role_level == RolePermissions.MANAGER:
+            # Manager can assign to Asst. Manager and General Employee
+            return target_role_level >= RolePermissions.ASST_MANAGER
+        elif user_role_level == RolePermissions.ASST_MANAGER:
+            # Asst. Manager can only assign to General Employee
+            return target_role_level == RolePermissions.GENERAL_EMPLOYEE
+        else:
+            # General Employee cannot assign tasks
+            return False
+    
+    @staticmethod
+    def can_view_reports_of(user_role_level, target_role_level):
+        """Check if user role can view reports from target role."""
+        if user_role_level == RolePermissions.MANAGER:
+            # Manager can view all reports in their branch
+            return True
+        elif user_role_level == RolePermissions.ASST_MANAGER:
+            # Asst. Manager can view their own and General Employee reports
+            return target_role_level >= RolePermissions.ASST_MANAGER
+        else:
+            # General Employee can only view their own reports
+            return user_role_level == target_role_level
+    
+    @staticmethod
+    def can_deactivate_role(user_role_level, target_role_level):
+        """Check if user role can deactivate/reactivate target role."""
+        if user_role_level == RolePermissions.MANAGER:
+            # Manager can deactivate Asst. Manager and General Employee
+            return target_role_level > user_role_level
+        elif user_role_level == RolePermissions.ASST_MANAGER:
+            # Asst. Manager can only deactivate General Employees
+            return target_role_level == RolePermissions.GENERAL_EMPLOYEE
+        else:
+            # General Employee cannot deactivate anyone
+            return False
+
+
+def get_date_range_from_filter(date_filter):
+    """Get start and end dates based on a date filter selection.
+    
+    Args:
+        date_filter: String representing the selected date range
+        
+    Returns:
+        tuple: (start_date, end_date)
+    """
+    today = datetime.date.today()
+    
+    if date_filter == "Today":
+        start_date = today
+        end_date = today
+    elif date_filter == "This Week":
+        start_date = today - datetime.timedelta(days=today.weekday())
+        end_date = today
+    elif date_filter == "This Month":
+        start_date = today.replace(day=1)
+        end_date = today
+    elif date_filter == "This Year":
+        start_date = today.replace(month=1, day=1)
+        end_date = today
+    else:  # All Time/Reports
+        start_date = datetime.date(2000, 1, 1)
+        end_date = today
+    
+    return start_date, end_date
+
+
+def format_timestamp(timestamp, format_str='%d %b, %Y'):
+    """Format a timestamp into a readable string.
+    
+    Args:
+        timestamp: Datetime object
+        format_str: Format string (default: '%d %b, %Y')
+        
+    Returns:
+        str: Formatted date string or "No date" if None
+    """
+    if timestamp:
+        return timestamp.strftime(format_str)
+    return "No due date"
+
+
+def calculate_completion_rate(total, completed):
+    """Calculate the completion rate as a percentage.
+    
+    Args:
+        total: Total number of items
+        completed: Number of completed items
+        
+    Returns:
+        int: Completion rate percentage
+    """
+    if total == 0:
+        return 0
+    return round((completed / total) * 100)
+
+
+def authenticate(engine, username, password):
+    """Authenticate a user based on username and password.
+    
+    Args:
+        engine: SQLAlchemy database engine
+        username: User's username
+        password: User's password
+        
+    Returns:
+        dict: User information if authentication succeeds, None otherwise
+    """
+    # Check if admin credentials are properly set in Streamlit secrets
+    if "admin_username" not in st.secrets or "admin_password" not in st.secrets:
+        st.warning("Admin credentials are not properly configured in Streamlit secrets. Please set admin_username and admin_password in .streamlit/secrets.toml")
+        return None
+    
+    # Check if credentials match admin in Streamlit secrets
+    admin_username = st.secrets["admin_username"]
+    admin_password = st.secrets["admin_password"]
+    
+    if username == admin_username and password == admin_password:
+        return {
+            "id": 0,  # Special ID for admin
+            "username": username, 
+            "full_name": "Administrator", 
+            "user_type": "admin",
+            "profile_pic_url": "https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y"
+        }
+    
+    # If not admin, check company credentials
+    with engine.connect() as conn:
+        result = conn.execute(text('''
+        SELECT id, company_name, username, profile_pic_url
+        FROM companies
+        WHERE username = :username AND password = :password AND is_active = TRUE
+        '''), {'username': username, 'password': password})
+        company = result.fetchone()
+    
+    if company:
+        return {
+            "id": company[0], 
+            "username": company[2], 
+            "full_name": company[1], 
+            "user_type": "company",
+            "profile_pic_url": company[3]
+        }
+    
+    # If not company, check employee credentials with role information
+    with engine.connect() as conn:
+        result = conn.execute(text('''
+        SELECT e.id, e.username, e.full_name, e.profile_pic_url, 
+               b.id as branch_id, b.branch_name, c.id as company_id, c.company_name,
+               r.id as role_id, r.role_name, r.role_level
+        FROM employees e
+        JOIN branches b ON e.branch_id = b.id
+        JOIN companies c ON b.company_id = c.id
+        JOIN employee_roles r ON e.role_id = r.id
+        WHERE e.username = :username AND e.password = :password 
+          AND e.is_active = TRUE AND b.is_active = TRUE AND c.is_active = TRUE
+        '''), {'username': username, 'password': password})
+        employee = result.fetchone()
+    
+    if employee:
+        return {
+            "id": employee[0], 
+            "username": employee[1], 
+            "full_name": employee[2],
+            "user_type": "employee",
+            "profile_pic_url": employee[3],
+            "branch_id": employee[4],
+            "branch_name": employee[5],
+            "company_id": employee[6],
+            "company_name": employee[7],
+            "role_id": employee[8],
+            "role_name": employee[9],
+            "role_level": employee[10]
+        }
+    
+    return None
+
+
+def logout():
+    """Log out the current user by clearing session state."""
+    st.session_state.pop("user", None)
+    st.rerun()
+
+
+def get_custom_css():
+    """Return the custom CSS for better UI styling.
+    
+    Returns:
+        str: CSS styles as a string
+    """
+    return """
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: 700;
+        color: #1E88E5;
+        margin-bottom: 1rem;
+        text-align: center;
+    }
+    
+    .sub-header {
+        font-size: 1.8rem;
+        font-weight: 600;
+        color: #333;
+        margin-bottom: 1rem;
+    }
+    
+    .card {
+        background-color: #f8f9fa;
+        border-radius: 10px;
+        padding: 1.5rem;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 1rem;
+    }
+    
+    .stat-card {
+        background-color: #ffffff;
+        border-radius: 8px;
+        padding: 1rem;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        text-align: center;
+    }
+    
+    .stat-value {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #1E88E5;
+    }
+    
+    .stat-label {
+        font-size: 1rem;
+        color: #777;
+    }
+    
+    .login-container {
+        max-width: 400px;
+        margin: 0 auto;
+        padding: 2.5rem;
+    }
+    
+    .login-header {
+        text-align: center;
+        margin-bottom: 1.5rem;
+    }
+    
+    .stButton > button {
+        width: 100%;
+        background-color: #1E88E5;
+        color: white;
+        font-weight: 600;
+        height: 2.5rem;
+        border-radius: 5px;
+    }
+    
+    .stTextInput > div > div > input {
+        height: 2.5rem;
+    }
+    
+    .report-item {
+        background-color: #f1f7fe;
+        padding: 1rem;
+        border-radius: 8px;
+        margin-bottom: 0.5rem;
+        border-left: 4px solid #1E88E5;
+    }
+    
+    .task-item {
+        background-color: #f1fff1;
+        padding: 1rem;
+        border-radius: 8px;
+        margin-bottom: 0.5rem;
+        border-left: 4px solid #4CAF50;
+    }
+    
+    .task-item.completed {
+        background-color: #f0f0f0;
+        border-left: 4px solid #9e9e9e;
+    }
+    
+    .profile-container {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        margin-bottom: 1.5rem;
+    }
+    
+    .profile-image {
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        object-fit: cover;
+        border: 3px solid #1E88E5;
+    }
+</style>
+"""
+
+
+def create_employee_report_pdf(reports, employee_name=None):
+    """Generate a PDF report for employee daily reports.
+    
+    Args:
+        reports: List of report data tuples (id, date, text)
+        employee_name: Name of the employee (optional)
+        
+    Returns:
+        bytes: PDF content as bytes
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    # Title
+    title_style = ParagraphStyle(
+        'Title',
+        parent=styles['Heading1'],
+        fontSize=16,
+        alignment=1,
+        spaceAfter=12
+    )
+    title = f"Work Reports: {employee_name}" if employee_name else "Work Reports"
+    elements.append(Paragraph(title, title_style))
+    elements.append(Spacer(1, 12))
+    
+    # Date range
+    if reports:
+        date_style = ParagraphStyle(
+            'DateRange',
+            parent=styles['Normal'],
+            fontSize=10,
+            alignment=1,
+            textColor=colors.gray
+        )
+        min_date = min(report[1] for report in reports).strftime('%d %b %Y')
+        max_date = max(report[1] for report in reports).strftime('%d %b %Y')
+        elements.append(Paragraph(f"Period: {min_date} to {max_date}", date_style))
+        elements.append(Spacer(1, 20))
+    
+    # Group reports by month
+    reports_by_month = {}
+    for report in reports:
+        month_year = report[1].strftime('%B %Y')
+        if month_year not in reports_by_month:
+            reports_by_month[month_year] = []
+        reports_by_month[month_year].append(report)
+    
+    # Add each month's reports
+    for month, month_reports in reports_by_month.items():
+        # Month header
+        month_style = ParagraphStyle(
+            'Month',
+            parent=styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10
+        )
+        elements.append(Paragraph(month, month_style))
+        
+        # Reports for the month
+        for report in month_reports:
+            # Date
+            date_style = ParagraphStyle(
+                'Date',
+                parent=styles['Normal'],
+                fontSize=11,
+                textColor=colors.blue
+            )
+            elements.append(Paragraph(report[1].strftime('%A, %d %b %Y'), date_style))
+            
+            # Report text
+            text_style = ParagraphStyle(
+                'ReportText',
+                parent=styles['Normal'],
+                fontSize=10,
+                leftIndent=10
+            )
+            elements.append(Paragraph(report[2], text_style))
+            elements.append(Spacer(1, 12))
+        
+        elements.append(Spacer(1, 10))
+    
+    # Build PDF
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def create_branch_report_pdf(reports, branch_name):
+    """Generate a PDF report for all employees in a branch.
+    
+    Args:
+        reports: List of report data tuples (id, employee_name, role, date, text, created_at)
+        branch_name: Name of the branch
+        
+    Returns:
+        bytes: PDF content as bytes
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    # Title
+    title_style = ParagraphStyle(
+        'Title',
+        parent=styles['Heading1'],
+        fontSize=16,
+        alignment=1,
+        spaceAfter=12
+    )
+    elements.append(Paragraph(f"Branch Reports: {branch_name}", title_style))
+    elements.append(Spacer(1, 12))
+    
+    # Date range
+    if reports:
+        date_style = ParagraphStyle(
+            'DateRange',
+            parent=styles['Normal'],
+            fontSize=10,
+            alignment=1,
+            textColor=colors.gray
+        )
+        min_date = min(report[3] for report in reports).strftime('%d %b %Y')
+        max_date = max(report[3] for report in reports).strftime('%d %b %Y')
+        elements.append(Paragraph(f"Period: {min_date} to {max_date}", date_style))
+        elements.append(Spacer(1, 20))
+    
+    # Group reports by employee and date
+    reports_by_employee = {}
+    for report in reports:
+        employee_name = report[1]
+        role_name = report[2]
+        
+        key = f"{employee_name} ({role_name})"
+        if key not in reports_by_employee:
+            reports_by_employee[key] = []
+        
+        reports_by_employee[key].append(report)
+    
+    # Add each employee's reports
+    for employee, emp_reports in reports_by_employee.items():
+        # Employee header
+        emp_style = ParagraphStyle(
+            'Employee',
+            parent=styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10
+        )
+        elements.append(Paragraph(employee, emp_style))
+        
+        # Group by date
+        for report in emp_reports:
+            # Date
+            date_style = ParagraphStyle(
+                'Date',
+                parent=styles['Normal'],
+                fontSize=11,
+                textColor=colors.blue
+            )
+            elements.append(Paragraph(report[3].strftime('%A, %d %b %Y'), date_style))
+            
+            # Report text
+            text_style = ParagraphStyle(
+                'ReportText',
+                parent=styles['Normal'],
+                fontSize=10,
+                leftIndent=10
+            )
+            elements.append(Paragraph(report[4], text_style))
+            elements.append(Spacer(1, 12))
+        
+        elements.append(Spacer(1, 15))
+    
+    # Build PDF
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def create_company_report_pdf(reports, company_name):
+    """Generate a PDF report for all branches in a company.
+    
+    Args:
+        reports: List of report data tuples (id, employee_name, role, branch_name, date, text, created_at)
+        company_name: Name of the company
+        
+    Returns:
+        bytes: PDF content as bytes
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, leftMargin=0.5*inch, rightMargin=0.5*inch)
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    # Title
+    title_style = ParagraphStyle(
+        'Title',
+        parent=styles['Heading1'],
+        fontSize=16,
+        alignment=1,
+        spaceAfter=12
+    )
+    elements.append(Paragraph(f"Company Reports: {company_name}", title_style))
+    elements.append(Spacer(1, 12))
+    
+    # Date range
+    if reports:
+        date_style = ParagraphStyle(
+            'DateRange',
+            parent=styles['Normal'],
+            fontSize=10,
+            alignment=1,
+            textColor=colors.gray
+        )
+        min_date = min(report[4] for report in reports).strftime('%d %b %Y')
+        max_date = max(report[4] for report in reports).strftime('%d %b %Y')
+        elements.append(Paragraph(f"Period: {min_date} to {max_date}", date_style))
+        elements.append(Spacer(1, 20))
+    
+    # Group reports by branch, then by employee
+    reports_by_branch = {}
+    for report in reports:
+        branch_name = report[3]
+        
+        if branch_name not in reports_by_branch:
+            reports_by_branch[branch_name] = {}
+        
+        employee_name = report[1]
+        role_name = report[2]
+        key = f"{employee_name} ({role_name})"
+        
+        if key not in reports_by_branch[branch_name]:
+            reports_by_branch[branch_name][key] = []
+        
+        reports_by_branch[branch_name][key].append(report)
+    
+    # Add each branch's reports
+    for branch_name, employees in reports_by_branch.items():
+        # Branch header
+        branch_style = ParagraphStyle(
+            'Branch',
+            parent=styles['Heading2'],
+            fontSize=16,
+            spaceAfter=10,
+            textColor=colors.blue
+        )
+        elements.append(Paragraph(f"Branch: {branch_name}", branch_style))
+        
+        # For each employee in the branch
+        for employee_name, emp_reports in employees.items():
+            # Employee header
+            emp_style = ParagraphStyle(
+                'Employee',
+                parent=styles['Heading3'],
+                fontSize=14,
+                spaceAfter=8
+            )
+            elements.append(Paragraph(employee_name, emp_style))
+            
+            # Group by date
+            emp_reports_by_date = {}
+            for report in emp_reports:
+                date_str = report[4].strftime('%Y-%m-%d')
+                if date_str not in emp_reports_by_date:
+                    emp_reports_by_date[date_str] = report
+            
+            # Add each report
+            for date_str, report in sorted(emp_reports_by_date.items(), reverse=True):
+                # Date
+                date_style = ParagraphStyle(
+                    'Date',
+                    parent=styles['Normal'],
+                    fontSize=11,
+                    textColor=colors.darkblue
+                )
+                elements.append(Paragraph(report[4].strftime('%A, %d %b %Y'), date_style))
+                
+                # Report text
+                text_style = ParagraphStyle(
+                    'ReportText',
+                    parent=styles['Normal'],
+                    fontSize=10,
+                    leftIndent=10
+                )
+                elements.append(Paragraph(report[5], text_style))
+                elements.append(Spacer(1, 10))
+            
+            elements.append(Spacer(1, 10))
+        
+        elements.append(Spacer(1, 20))
+    
+    # Build PDF
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def create_role_report_pdf(reports, role_name, company_name):
+    """Generate a PDF report for all employees of a specific role.
+    
+    Args:
+        reports: List of report data tuples with employee and branch info
+        role_name: Name of the role
+        company_name: Name of the company
+        
+    Returns:
+        bytes: PDF content as bytes
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    # Title
+    title_style = ParagraphStyle(
+        'Title',
+        parent=styles['Heading1'],
+        fontSize=16,
+        alignment=1,
+        spaceAfter=12
+    )
+    elements.append(Paragraph(f"{role_name} Reports - {company_name}", title_style))
+    elements.append(Spacer(1, 12))
+    
+    # Date range
+    if reports:
+        date_style = ParagraphStyle(
+            'DateRange',
+            parent=styles['Normal'],
+            fontSize=10,
+            alignment=1,
+            textColor=colors.gray
+        )
+        min_date = min(report[4] for report in reports).strftime('%d %b %Y')
+        max_date = max(report[4] for report in reports).strftime('%d %b %Y')
+        elements.append(Paragraph(f"Period: {min_date} to {max_date}", date_style))
+        elements.append(Spacer(1, 20))
+    
+    # Group reports by employee and branch
+    reports_by_employee = {}
+    for report in reports:
+        employee_name = report[1]
+        branch_name = report[3]
+        
+        key = f"{employee_name} ({branch_name})"
+        if key not in reports_by_employee:
+            reports_by_employee[key] = []
+        
+        reports_by_employee[key].append(report)
+    
+    # Add each employee's reports
+    for employee, emp_reports in reports_by_employee.items():
+        # Employee header
+        emp_style = ParagraphStyle(
+            'Employee',
+            parent=styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10
+        )
+        elements.append(Paragraph(employee, emp_style))
+        
+        # Group by date
+        emp_reports_by_date = {}
+        for report in emp_reports:
+            date_str = report[4].strftime('%Y-%m-%d')
+            if date_str not in emp_reports_by_date:
+                emp_reports_by_date[date_str] = report
+        
+        # Add each report
+        for date_str, report in sorted(emp_reports_by_date.items(), reverse=True):
+            # Date
+            date_style = ParagraphStyle(
+                'Date',
+                parent=styles['Normal'],
+                fontSize=11,
+                textColor=colors.blue
+            )
+            elements.append(Paragraph(report[4].strftime('%A, %d %b %Y'), date_style))
+            
+            # Report text
+            text_style = ParagraphStyle(
+                'ReportText',
+                parent=styles['Normal'],
+                fontSize=10,
+                leftIndent=10
+            )
+            elements.append(Paragraph(report[5], text_style))
+            elements.append(Spacer(1, 10))
+        
+        elements.append(Spacer(1, 15))
+    
+    # Build PDF
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+#########################################
+# UI COMPONENTS
+#########################################
+
+def display_profile_header(user):
+    """Display user profile header with image and name.
+    
+    Args:
+        user: User dict with profile information
+    """
+    col1, col2, col3 = st.columns([1, 3, 1])
+    with col2:
+        st.markdown('<div class="profile-container">', unsafe_allow_html=True)
+        try:
+            st.image(user["profile_pic_url"], width=80, clamp=True, output_format="auto", 
+                    channels="RGB", use_container_width=False)
+        except:
+            st.image("https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y", 
+                    width=80, use_container_width=False)
+        
+        user_type = "Administrator" if user.get("is_admin", False) else "Employee"
+        st.markdown(f'''
+        <div>
+            <h3>{user["full_name"]}</h3>
+            <p>{user_type}</p>
+        </div>
+        ''', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+def display_stats_card(value, label):
+    """Display a statistics card with value and label.
+    
+    Args:
+        value: The statistic value to display
+        label: The label for the statistic
+    """
+    st.markdown('<div class="stat-card">', unsafe_allow_html=True)
+    st.markdown(f'<div class="stat-value">{value}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="stat-label">{label}</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
 def view_branch_employee_reports(engine, branch_id, role_level):
     """View reports based on role permissions.
     
@@ -3623,2324 +5947,4 @@ def view_all_reports(engine):
                             <p>{report[2]}</p>
                         </div>
                         ''', unsafe_allow_html=True)
-            for message in recent_messagesimport streamlit as st
-import datetime
-import time
-from datetime import timedelta
-import io
-from sqlalchemy import create_engine, text
-from reportlab.lib.pagesizes import letter, landscape
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
-from reportlab.lib.units import inch
-from io import BytesIO
-
-#########################################
-# DATABASE CONNECTION
-#########################################
-
-@st.cache_resource
-def init_connection():
-    """Initialize database connection with caching.
-    
-    Returns:
-        SQLAlchemy engine or None if connection fails
-    """
-    try:
-        return create_engine(st.secrets["postgres"]["url"])
-    except Exception as e:
-        st.error(f"Database connection error: {e}")
-        return None
-
-def init_db(engine):
-    """Initialize database tables if they don't exist.
-    
-    Args:
-        engine: SQLAlchemy database engine
-    """
-    with engine.connect() as conn:
-        conn.execute(text('''
-        -- Companies table
-        CREATE TABLE IF NOT EXISTS companies (
-            id SERIAL PRIMARY KEY,
-            company_name VARCHAR(100) UNIQUE NOT NULL,
-            username VARCHAR(50) UNIQUE NOT NULL,
-            password VARCHAR(255) NOT NULL,
-            profile_pic_url TEXT,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        -- Branches table (with parent branch support)
-        CREATE TABLE IF NOT EXISTS branches (
-            id SERIAL PRIMARY KEY,
-            company_id INTEGER REFERENCES companies(id),
-            parent_branch_id INTEGER REFERENCES branches(id),
-            branch_name VARCHAR(100) NOT NULL,
-            is_main_branch BOOLEAN DEFAULT FALSE,
-            location VARCHAR(255),
-            branch_head VARCHAR(100),
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(company_id, branch_name)
-        );
-        
-        -- Employee Roles table
-        CREATE TABLE IF NOT EXISTS employee_roles (
-            id SERIAL PRIMARY KEY,
-            role_name VARCHAR(50) NOT NULL,
-            role_level INTEGER NOT NULL,
-            company_id INTEGER REFERENCES companies(id),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(company_id, role_name)
-        );
-        
-        -- Messages table
-        CREATE TABLE IF NOT EXISTS messages (
-            id SERIAL PRIMARY KEY,
-            sender_type VARCHAR(20) NOT NULL, -- 'admin' or 'company'
-            sender_id INTEGER NOT NULL,
-            receiver_type VARCHAR(20) NOT NULL, -- 'admin' or 'company'
-            receiver_id INTEGER NOT NULL,
-            message_text TEXT NOT NULL,
-            is_read BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        -- Employees table (now with roles)
-        CREATE TABLE IF NOT EXISTS employees (
-            id SERIAL PRIMARY KEY,
-            branch_id INTEGER REFERENCES branches(id),
-            role_id INTEGER REFERENCES employee_roles(id),
-            username VARCHAR(50) UNIQUE NOT NULL,
-            password VARCHAR(255) NOT NULL,
-            full_name VARCHAR(100) NOT NULL,
-            profile_pic_url TEXT,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        -- Tasks table (updated for branch assignment)
-        CREATE TABLE IF NOT EXISTS tasks (
-            id SERIAL PRIMARY KEY,
-            company_id INTEGER REFERENCES companies(id),
-            branch_id INTEGER REFERENCES branches(id),
-            employee_id INTEGER REFERENCES employees(id),
-            task_description TEXT NOT NULL,
-            due_date DATE,
-            is_completed BOOLEAN DEFAULT FALSE,
-            completed_by_id INTEGER REFERENCES employees(id),
-            completed_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        -- Task Assignments for tracking branch-level task completions
-        CREATE TABLE IF NOT EXISTS task_assignments (
-            id SERIAL PRIMARY KEY,
-            task_id INTEGER REFERENCES tasks(id),
-            employee_id INTEGER REFERENCES employees(id),
-            is_completed BOOLEAN DEFAULT FALSE,
-            completed_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(task_id, employee_id)
-        );
-        
-        -- Daily reports table (unchanged)
-        CREATE TABLE IF NOT EXISTS daily_reports (
-            id SERIAL PRIMARY KEY,
-            employee_id INTEGER REFERENCES employees(id),
-            report_date DATE NOT NULL,
-            report_text TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        -- Insert default employee roles if they don't exist
-        INSERT INTO employee_roles (role_name, role_level, company_id)
-        SELECT 'Manager', 1, id FROM companies
-        WHERE NOT EXISTS (
-            SELECT 1 FROM employee_roles WHERE role_name = 'Manager' AND company_id = companies.id
-        );
-        
-        INSERT INTO employee_roles (role_name, role_level, company_id)
-        SELECT 'Asst. Manager', 2, id FROM companies
-        WHERE NOT EXISTS (
-            SELECT 1 FROM employee_roles WHERE role_name = 'Asst. Manager' AND company_id = companies.id
-        );
-        
-        INSERT INTO employee_roles (role_name, role_level, company_id)
-        SELECT 'General Employee', 3, id FROM companies
-        WHERE NOT EXISTS (
-            SELECT 1 FROM employee_roles WHERE role_name = 'General Employee' AND company_id = companies.id
-        );
-        
-        -- Set existing employees to General Employee role by default
-        UPDATE employees e
-        SET role_id = r.id
-        FROM employee_roles r
-        JOIN branches b ON r.company_id = b.company_id
-        WHERE e.branch_id = b.id AND r.role_name = 'General Employee' AND e.role_id IS NULL;
-        '''))
-        conn.commit()
-
-#########################################
-# DATA MODELS
-#########################################
-
-class CompanyModel:
-    """Company data operations"""
-    
-    @staticmethod
-    def get_all_companies(conn):
-        """Get all companies from the database."""
-        result = conn.execute(text('''
-        SELECT id, company_name, username, profile_pic_url, is_active, created_at 
-        FROM companies
-        ORDER BY company_name
-        '''))
-        return result.fetchall()
-    
-    @staticmethod
-    def get_active_companies(conn):
-        """Get all active companies."""
-        result = conn.execute(text('''
-        SELECT id, company_name FROM companies 
-        WHERE is_active = TRUE
-        ORDER BY company_name
-        '''))
-        return result.fetchall()
-    
-    @staticmethod
-    def get_company_by_id(conn, company_id):
-        """Get company data by ID."""
-        result = conn.execute(text('''
-        SELECT company_name, username, profile_pic_url, is_active
-        FROM companies
-        WHERE id = :company_id
-        '''), {'company_id': company_id})
-        return result.fetchone()
-    
-    @staticmethod
-    def add_company(conn, company_name, username, password, profile_pic_url):
-        """Add a new company to the database."""
-        default_pic = "https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y"
-        
-        conn.execute(text('''
-        INSERT INTO companies (company_name, username, password, profile_pic_url, is_active)
-        VALUES (:company_name, :username, :password, :profile_pic_url, TRUE)
-        '''), {
-            'company_name': company_name,
-            'username': username,
-            'password': password,
-            'profile_pic_url': profile_pic_url if profile_pic_url else default_pic
-        })
-        conn.commit()
-    
-    @staticmethod
-    def update_company_status(conn, company_id, is_active):
-        """Activate or deactivate a company and all its branches and employees."""
-        # Update company status
-        conn.execute(text('UPDATE companies SET is_active = :is_active WHERE id = :id'), 
-                    {'id': company_id, 'is_active': is_active})
-        
-        # Update all branches for this company
-        conn.execute(text('''
-        UPDATE branches 
-        SET is_active = :is_active 
-        WHERE company_id = :company_id
-        '''), {'company_id': company_id, 'is_active': is_active})
-        
-        # Update all employees in all branches of this company
-        conn.execute(text('''
-        UPDATE employees 
-        SET is_active = :is_active 
-        WHERE branch_id IN (SELECT id FROM branches WHERE company_id = :company_id)
-        '''), {'company_id': company_id, 'is_active': is_active})
-        
-        conn.commit()
-    
-    @staticmethod
-    def reset_password(conn, company_id, new_password):
-        """Reset a company's password."""
-        conn.execute(text('UPDATE companies SET password = :password WHERE id = :id'), 
-                    {'id': company_id, 'password': new_password})
-        conn.commit()
-    
-    @staticmethod
-    def update_profile(conn, company_id, company_name, profile_pic_url):
-        """Update company profile information."""
-        conn.execute(text('''
-        UPDATE companies
-        SET company_name = :company_name, profile_pic_url = :profile_pic_url
-        WHERE id = :company_id
-        '''), {
-            'company_name': company_name,
-            'profile_pic_url': profile_pic_url,
-            'company_id': company_id
-        })
-        conn.commit()
-    
-    @staticmethod
-    def verify_password(conn, company_id, current_password):
-        """Verify company's current password."""
-        result = conn.execute(text('''
-        SELECT COUNT(*)
-        FROM companies
-        WHERE id = :company_id AND password = :current_password
-        '''), {'company_id': company_id, 'current_password': current_password})
-        return result.fetchone()[0] > 0
-
-
-class BranchModel:
-    """Branch data operations"""
-    
-    @staticmethod
-    def get_all_branches(conn):
-        """Get all branches with company information."""
-        result = conn.execute(text('''
-        SELECT b.id, b.branch_name, b.location, b.branch_head, b.is_active, 
-               c.company_name, c.id as company_id, b.is_main_branch,
-               p.branch_name as parent_branch_name, p.id as parent_branch_id
-        FROM branches b
-        JOIN companies c ON b.company_id = c.id
-        LEFT JOIN branches p ON b.parent_branch_id = p.id
-        ORDER BY c.company_name, b.is_main_branch DESC, b.branch_name
-        '''))
-        return result.fetchall()
-    
-    @staticmethod
-    def get_company_branches(conn, company_id):
-        """Get all branches for a specific company."""
-        result = conn.execute(text('''
-        SELECT b.id, b.branch_name, b.location, b.branch_head, b.is_active,
-               b.is_main_branch, b.parent_branch_id,
-               p.branch_name as parent_branch_name
-        FROM branches b
-        LEFT JOIN branches p ON b.parent_branch_id = p.id
-        WHERE b.company_id = :company_id
-        ORDER BY b.is_main_branch DESC, b.branch_name
-        '''), {'company_id': company_id})
-        return result.fetchall()
-    
-    @staticmethod
-    def get_branch_by_id(conn, branch_id):
-        """Get branch details by ID."""
-        result = conn.execute(text('''
-        SELECT b.id, b.branch_name, b.location, b.branch_head, b.is_active,
-               b.is_main_branch, b.parent_branch_id, b.company_id,
-               p.branch_name as parent_branch_name
-        FROM branches b
-        LEFT JOIN branches p ON b.parent_branch_id = p.id
-        WHERE b.id = :branch_id
-        '''), {'branch_id': branch_id})
-        return result.fetchone()
-    
-    @staticmethod
-    def get_parent_branches(conn, company_id, exclude_branch_id=None):
-        """Get all possible parent branches for a company (for creating sub-branches)."""
-        query = '''
-        SELECT id, branch_name 
-        FROM branches
-        WHERE company_id = :company_id AND is_active = TRUE
-        '''
-        
-        params = {'company_id': company_id}
-        
-        if exclude_branch_id:
-            query += ' AND id != :exclude_branch_id'
-            params['exclude_branch_id'] = exclude_branch_id
-        
-        query += ' ORDER BY is_main_branch DESC, branch_name'
-        
-        result = conn.execute(text(query), params)
-        return result.fetchall()
-    
-    @staticmethod
-    def get_active_branches(conn, company_id=None):
-        """Get all active branches, optionally filtered by company."""
-        query = '''
-        SELECT b.id, b.branch_name, c.company_name
-        FROM branches b
-        JOIN companies c ON b.company_id = c.id
-        WHERE b.is_active = TRUE AND c.is_active = TRUE
-        '''
-        
-        params = {}
-        if company_id:
-            query += ' AND b.company_id = :company_id'
-            params = {'company_id': company_id}
-        
-        query += ' ORDER BY c.company_name, b.is_main_branch DESC, b.branch_name'
-        
-        result = conn.execute(text(query), params)
-        return result.fetchall()
-    
-    @staticmethod
-    def create_main_branch(conn, company_id, branch_name, location, branch_head):
-        """Create a main branch for a company."""
-        conn.execute(text('''
-        INSERT INTO branches (company_id, branch_name, location, branch_head, is_main_branch, parent_branch_id, is_active)
-        VALUES (:company_id, :branch_name, :location, :branch_head, TRUE, NULL, TRUE)
-        '''), {
-            'company_id': company_id,
-            'branch_name': branch_name,
-            'location': location,
-            'branch_head': branch_head
-        })
-        conn.commit()
-    
-    @staticmethod
-    def create_sub_branch(conn, company_id, parent_branch_id, branch_name, location, branch_head):
-        """Create a sub-branch under a parent branch."""
-        conn.execute(text('''
-        INSERT INTO branches (company_id, parent_branch_id, branch_name, location, branch_head, is_main_branch, is_active)
-        VALUES (:company_id, :parent_branch_id, :branch_name, :location, :branch_head, FALSE, TRUE)
-        '''), {
-            'company_id': company_id,
-            'parent_branch_id': parent_branch_id,
-            'branch_name': branch_name,
-            'location': location,
-            'branch_head': branch_head
-        })
-        conn.commit()
-    
-    @staticmethod
-    def update_branch(conn, branch_id, branch_name, location, branch_head, parent_branch_id=None):
-        """Update branch details."""
-        query = '''
-        UPDATE branches 
-        SET branch_name = :branch_name, location = :location, branch_head = :branch_head
-        '''
-        
-        params = {
-            'branch_id': branch_id,
-            'branch_name': branch_name,
-            'location': location,
-            'branch_head': branch_head
-        }
-        
-        # Only update parent_branch_id if provided and branch is not a main branch
-        if parent_branch_id is not None:
-            result = conn.execute(text('SELECT is_main_branch FROM branches WHERE id = :branch_id'), 
-                                 {'branch_id': branch_id})
-            is_main_branch = result.fetchone()[0]
-            
-            if not is_main_branch:
-                query += ', parent_branch_id = :parent_branch_id'
-                params['parent_branch_id'] = parent_branch_id
-        
-        query += ' WHERE id = :branch_id'
-        
-        conn.execute(text(query), params)
-        conn.commit()
-    
-    @staticmethod
-    def update_branch_status(conn, branch_id, is_active):
-        """Update branch active status and update related employees status too."""
-        with conn.begin():
-            # Update branch status
-            conn.execute(text('''
-            UPDATE branches 
-            SET is_active = :is_active
-            WHERE id = :branch_id
-            '''), {'branch_id': branch_id, 'is_active': is_active})
-            
-            # Update employees in this branch
-            conn.execute(text('''
-            UPDATE employees 
-            SET is_active = :is_active
-            WHERE branch_id = :branch_id
-            '''), {'branch_id': branch_id, 'is_active': is_active})
-        
-    @staticmethod
-    def get_branch_employees(conn, branch_id):
-        """Get all employees for a specific branch."""
-        result = conn.execute(text('''
-        SELECT e.id, e.username, e.full_name, e.profile_pic_url, e.is_active, r.role_name, r.role_level
-        FROM employees e
-        JOIN employee_roles r ON e.role_id = r.id
-        WHERE e.branch_id = :branch_id
-        ORDER BY r.role_level, e.full_name
-        '''), {'branch_id': branch_id})
-        return result.fetchall()
-    
-    @staticmethod
-    def get_employee_count_by_branch(conn, company_id):
-        """Get employee count for each branch of a company."""
-        result = conn.execute(text('''
-        SELECT b.id, b.branch_name, COUNT(e.id) as employee_count
-        FROM branches b
-        LEFT JOIN employees e ON b.id = e.branch_id AND e.is_active = TRUE
-        WHERE b.company_id = :company_id
-        GROUP BY b.id, b.branch_name
-        ORDER BY b.is_main_branch DESC, b.branch_name
-        '''), {'company_id': company_id})
-        return result.fetchall()
-    
-    @staticmethod
-    def get_subbranches(conn, parent_branch_id):
-        """Get all sub-branches of a branch."""
-        result = conn.execute(text('''
-        SELECT id, branch_name, is_active
-        FROM branches
-        WHERE parent_branch_id = :parent_branch_id
-        ORDER BY branch_name
-        '''), {'parent_branch_id': parent_branch_id})
-        return result.fetchall()
-
-
-class EmployeeModel:
-    """Employee data operations"""
-    
-    @staticmethod
-    def get_all_employees(conn, company_id=None):
-        """Get all employees with optional company filter.
-        
-        Args:
-            conn: Database connection
-            company_id: Optional company ID filter
-            
-        Returns:
-            List of employees with branch and role info
-        """
-        query = '''
-        SELECT e.id, e.username, e.full_name, e.profile_pic_url, e.is_active,
-               b.branch_name, c.company_name, r.role_name, r.role_level, b.id as branch_id
-        FROM employees e
-        JOIN branches b ON e.branch_id = b.id
-        JOIN companies c ON b.company_id = c.id
-        JOIN employee_roles r ON e.role_id = r.id
-        '''
-        
-        params = {}
-        if company_id:
-            query += ' WHERE b.company_id = :company_id'
-            params = {'company_id': company_id}
-        
-        query += ' ORDER BY c.company_name, b.branch_name, r.role_level, e.full_name'
-        
-        result = conn.execute(text(query), params)
-        return result.fetchall()
-    
-    @staticmethod
-    def get_branch_employees(conn, branch_id):
-        """Get all employees for a specific branch.
-        
-        Args:
-            conn: Database connection
-            branch_id: ID of the branch
-            
-        Returns:
-            List of employees with role info
-        """
-        result = conn.execute(text('''
-        SELECT e.id, e.username, e.full_name, e.profile_pic_url, e.is_active, 
-               r.role_name, r.role_level, r.id as role_id
-        FROM employees e
-        JOIN employee_roles r ON e.role_id = r.id
-        WHERE e.branch_id = :branch_id
-        ORDER BY r.role_level, e.full_name
-        '''), {'branch_id': branch_id})
-        return result.fetchall()
-    
-    @staticmethod
-    def get_active_employees(conn, company_id=None, branch_id=None, role_level=None):
-        """Get active employees with optional filters.
-        
-        Args:
-            conn: Database connection
-            company_id: Optional company ID filter
-            branch_id: Optional branch ID filter
-            role_level: Optional role level filter
-            
-        Returns:
-            List of active employees
-        """
-        query = '''
-        SELECT e.id, e.full_name, b.branch_name, c.company_name, r.role_name
-        FROM employees e
-        JOIN branches b ON e.branch_id = b.id
-        JOIN companies c ON b.company_id = c.id
-        JOIN employee_roles r ON e.role_id = r.id
-        WHERE e.is_active = TRUE 
-          AND b.is_active = TRUE
-          AND c.is_active = TRUE
-        '''
-        
-        params = {}
-        
-        if company_id:
-            query += ' AND c.id = :company_id'
-            params['company_id'] = company_id
-        
-        if branch_id:
-            query += ' AND b.id = :branch_id'
-            params['branch_id'] = branch_id
-        
-        if role_level:
-            query += ' AND r.role_level = :role_level'
-            params['role_level'] = role_level
-        
-        query += ' ORDER BY b.branch_name, r.role_level, e.full_name'
-        
-        result = conn.execute(text(query), params)
-        return result.fetchall()
-    
-    @staticmethod
-    def get_employee_by_id(conn, employee_id):
-        """Get detailed employee data by ID.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            
-        Returns:
-            Employee details including branch and role info
-        """
-        result = conn.execute(text('''
-        SELECT e.id, e.username, e.full_name, e.profile_pic_url, e.is_active,
-               b.id as branch_id, b.branch_name, r.id as role_id, r.role_name, 
-               c.id as company_id
-        FROM employees e
-        JOIN branches b ON e.branch_id = b.id
-        JOIN employee_roles r ON e.role_id = r.id
-        JOIN companies c ON b.company_id = c.id
-        WHERE e.id = :employee_id
-        '''), {'employee_id': employee_id})
-        return result.fetchone()
-    
-    @staticmethod
-    def add_employee(conn, branch_id, role_id, username, password, full_name, profile_pic_url):
-        """Add a new employee.
-        
-        Args:
-            conn: Database connection
-            branch_id: ID of the branch
-            role_id: ID of the role
-            username: Username for login
-            password: Password for login
-            full_name: Full name of employee
-            profile_pic_url: URL to profile picture
-        """
-        default_pic = "https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y"
-        
-        conn.execute(text('''
-        INSERT INTO employees (branch_id, role_id, username, password, full_name, profile_pic_url, is_active)
-        VALUES (:branch_id, :role_id, :username, :password, :full_name, :profile_pic_url, TRUE)
-        '''), {
-            'branch_id': branch_id,
-            'role_id': role_id,
-            'username': username,
-            'password': password,
-            'full_name': full_name,
-            'profile_pic_url': profile_pic_url if profile_pic_url else default_pic
-        })
-        conn.commit()
-    
-    @staticmethod
-    def update_employee_status(conn, employee_id, is_active):
-        """Activate or deactivate an employee.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            is_active: New active status
-        """
-        conn.execute(text('UPDATE employees SET is_active = :is_active WHERE id = :id'), 
-                    {'id': employee_id, 'is_active': is_active})
-        conn.commit()
-    
-    @staticmethod
-    def update_employee_role(conn, employee_id, role_id):
-        """Update employee's role.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            role_id: New role ID
-        """
-        conn.execute(text('''
-        UPDATE employees
-        SET role_id = :role_id
-        WHERE id = :employee_id
-        '''), {
-            'employee_id': employee_id,
-            'role_id': role_id
-        })
-        conn.commit()
-    
-    @staticmethod
-    def update_employee_branch(conn, employee_id, branch_id):
-        """Transfer employee to different branch.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            branch_id: New branch ID
-        """
-        conn.execute(text('''
-        UPDATE employees
-        SET branch_id = :branch_id
-        WHERE id = :employee_id
-        '''), {
-            'employee_id': employee_id,
-            'branch_id': branch_id
-        })
-        conn.commit()
-    
-    @staticmethod
-    def reset_password(conn, employee_id, new_password):
-        """Reset an employee's password.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            new_password: New password
-        """
-        conn.execute(text('UPDATE employees SET password = :password WHERE id = :id'), 
-                    {'id': employee_id, 'password': new_password})
-        conn.commit()
-    
-    @staticmethod
-    def update_profile(conn, employee_id, full_name, profile_pic_url):
-        """Update employee profile information.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            full_name: New full name
-            profile_pic_url: New profile picture URL
-        """
-        conn.execute(text('''
-        UPDATE employees
-        SET full_name = :full_name, profile_pic_url = :profile_pic_url
-        WHERE id = :employee_id
-        '''), {
-            'full_name': full_name,
-            'profile_pic_url': profile_pic_url,
-            'employee_id': employee_id
-        })
-        conn.commit()
-    
-    @staticmethod
-    def verify_password(conn, employee_id, current_password):
-        """Verify employee's current password.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            current_password: Password to verify
-            
-        Returns:
-            bool: True if password matches, False otherwise
-        """
-        result = conn.execute(text('''
-        SELECT COUNT(*)
-        FROM employees
-        WHERE id = :employee_id AND password = :current_password
-        '''), {'employee_id': employee_id, 'current_password': current_password})
-        return result.fetchone()[0] > 0
-    
-    @staticmethod
-    def update_password(conn, employee_id, new_password):
-        """Update an employee's password.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            new_password: New password
-        """
-        conn.execute(text('''
-        UPDATE employees
-        SET password = :new_password
-        WHERE id = :employee_id
-        '''), {
-            'employee_id': employee_id,
-            'new_password': new_password
-        })
-        conn.commit()
-
-
-class MessageModel:
-    """Message data operations"""
-    
-    @staticmethod
-    def send_message(conn, sender_type, sender_id, receiver_type, receiver_id, message_text):
-        """Send a new message."""
-        conn.execute(text('''
-        INSERT INTO messages 
-        (sender_type, sender_id, receiver_type, receiver_id, message_text, is_read)
-        VALUES (:sender_type, :sender_id, :receiver_type, :receiver_id, :message_text, FALSE)
-        '''), {
-            'sender_type': sender_type,
-            'sender_id': sender_id,
-            'receiver_type': receiver_type,
-            'receiver_id': receiver_id,
-            'message_text': message_text
-        })
-        conn.commit()
-    
-    @staticmethod
-    def mark_as_read(conn, message_id):
-        """Mark a message as read."""
-        conn.execute(text('UPDATE messages SET is_read = TRUE WHERE id = :id'), 
-                    {'id': message_id})
-        conn.commit()
-    
-    @staticmethod
-    def get_messages_for_admin(conn):
-        """Get all messages for admin."""
-        result = conn.execute(text('''
-        SELECT m.id, m.sender_type, m.sender_id, m.message_text, m.is_read, m.created_at,
-               CASE WHEN m.sender_type = 'company' THEN c.company_name ELSE 'Admin' END as sender_name
-        FROM messages m
-        LEFT JOIN companies c ON m.sender_type = 'company' AND m.sender_id = c.id
-        WHERE m.receiver_type = 'admin'
-        ORDER BY m.created_at DESC
-        '''))
-        return result.fetchall()
-    
-    @staticmethod
-    def get_messages_for_company(conn, company_id):
-        """Get all messages for a specific company."""
-        result = conn.execute(text('''
-        SELECT m.id, m.sender_type, m.sender_id, m.message_text, m.is_read, m.created_at,
-               CASE WHEN m.sender_type = 'admin' THEN 'Admin' ELSE c.company_name END as sender_name
-        FROM messages m
-        LEFT JOIN companies c ON m.sender_type = 'company' AND m.sender_id = c.id
-        WHERE (m.receiver_type = 'company' AND m.receiver_id = :company_id)
-           OR (m.sender_type = 'company' AND m.sender_id = :company_id)
-        ORDER BY m.created_at DESC
-        '''), {'company_id': company_id})
-        return result.fetchall()
-
-
-class RoleModel:
-    """Employee role data operations"""
-    
-    @staticmethod
-    def get_all_roles(conn, company_id):
-        """Get all roles for a company.
-        
-        Args:
-            conn: Database connection
-            company_id: ID of the company
-            
-        Returns:
-            List of roles (id, name, level)
-        """
-        result = conn.execute(text('''
-        SELECT id, role_name, role_level
-        FROM employee_roles
-        WHERE company_id = :company_id
-        ORDER BY role_level
-        '''), {'company_id': company_id})
-        return result.fetchall()
-    
-    @staticmethod
-    def get_role_by_id(conn, role_id):
-        """Get role details by ID.
-        
-        Args:
-            conn: Database connection
-            role_id: ID of the role
-            
-        Returns:
-            Role details (id, name, level, company_id)
-        """
-        result = conn.execute(text('''
-        SELECT id, role_name, role_level, company_id
-        FROM employee_roles
-        WHERE id = :role_id
-        '''), {'role_id': role_id})
-        return result.fetchone()
-    
-    @staticmethod
-    def create_role(conn, company_id, role_name, role_level):
-        """Create a new role.
-        
-        Args:
-            conn: Database connection
-            company_id: ID of the company
-            role_name: Name of the role
-            role_level: Level of the role (lower number = higher rank)
-        """
-        conn.execute(text('''
-        INSERT INTO employee_roles (company_id, role_name, role_level)
-        VALUES (:company_id, :role_name, :role_level)
-        '''), {
-            'company_id': company_id,
-            'role_name': role_name,
-            'role_level': role_level
-        })
-        conn.commit()
-    
-    @staticmethod
-    def update_role(conn, role_id, role_name, role_level):
-        """Update role details.
-        
-        Args:
-            conn: Database connection
-            role_id: ID of the role
-            role_name: New name for the role
-            role_level: New level for the role
-        """
-        conn.execute(text('''
-        UPDATE employee_roles
-        SET role_name = :role_name, role_level = :role_level
-        WHERE id = :role_id
-        '''), {
-            'role_id': role_id,
-            'role_name': role_name,
-            'role_level': role_level
-        })
-        conn.commit()
-    
-    @staticmethod
-    def delete_role(conn, role_id, replacement_role_id):
-        """Delete a role and reassign employees to another role.
-        
-        Args:
-            conn: Database connection
-            role_id: ID of the role to delete
-            replacement_role_id: ID of the role to assign employees to
-        """
-        with conn.begin():
-            # First reassign all employees with this role
-            conn.execute(text('''
-            UPDATE employees
-            SET role_id = :replacement_role_id
-            WHERE role_id = :role_id
-            '''), {
-                'role_id': role_id,
-                'replacement_role_id': replacement_role_id
-            })
-            
-            # Then delete the role
-            conn.execute(text('''
-            DELETE FROM employee_roles
-            WHERE id = :role_id
-            '''), {'role_id': role_id})
-    
-    @staticmethod
-    def get_manager_roles(conn, company_id):
-        """Get roles that are considered management (Manager and Asst. Manager).
-        
-        Args:
-            conn: Database connection
-            company_id: ID of the company
-            
-        Returns:
-            List of management role IDs
-        """
-        result = conn.execute(text('''
-        SELECT id 
-        FROM employee_roles
-        WHERE company_id = :company_id AND role_level <= 2
-        '''), {'company_id': company_id})
-        return [row[0] for row in result.fetchall()]
-    
-    @staticmethod
-    def initialize_default_roles(conn, company_id):
-        """Initialize default roles for a new company.
-        
-        Args:
-            conn: Database connection
-            company_id: ID of the company
-        """
-        # Check if roles already exist for this company
-        result = conn.execute(text('''
-        SELECT COUNT(*) FROM employee_roles WHERE company_id = :company_id
-        '''), {'company_id': company_id})
-        
-        if result.fetchone()[0] == 0:
-            # Create default roles
-            default_roles = [
-                ('Manager', 1),
-                ('Asst. Manager', 2),
-                ('General Employee', 3)
-            ]
-            
-            for role_name, role_level in default_roles:
-                conn.execute(text('''
-                INSERT INTO employee_roles (company_id, role_name, role_level)
-                VALUES (:company_id, :role_name, :role_level)
-                '''), {
-                    'company_id': company_id,
-                    'role_name': role_name,
-                    'role_level': role_level
-                })
-            
-            conn.commit()
-
-
-class ReportModel:
-    """Daily report data operations with advanced filtering"""
-    
-    @staticmethod
-    def get_employee_reports(conn, employee_id, start_date, end_date):
-        """Get reports for a specific employee within a date range.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            start_date: Start date for filtering
-            end_date: End date for filtering
-            
-        Returns:
-            List of reports
-        """
-        result = conn.execute(text('''
-        SELECT id, report_date, report_text
-        FROM daily_reports
-        WHERE employee_id = :employee_id
-        AND report_date BETWEEN :start_date AND :end_date
-        ORDER BY report_date DESC
-        '''), {'employee_id': employee_id, 'start_date': start_date, 'end_date': end_date})
-        return result.fetchall()
-    
-    @staticmethod
-    def get_branch_reports(conn, branch_id, start_date, end_date, role_id=None):
-        """Get reports for all employees in a branch within a date range.
-        
-        Args:
-            conn: Database connection
-            branch_id: ID of the branch
-            start_date: Start date for filtering
-            end_date: End date for filtering
-            role_id: Optional role ID for filtering
-            
-        Returns:
-            List of reports with employee info
-        """
-        query = '''
-        SELECT dr.id, e.full_name, r.role_name, dr.report_date, dr.report_text, dr.created_at
-        FROM daily_reports dr
-        JOIN employees e ON dr.employee_id = e.id
-        JOIN employee_roles r ON e.role_id = r.id
-        WHERE e.branch_id = :branch_id
-        AND dr.report_date BETWEEN :start_date AND :end_date
-        '''
-        
-        params = {
-            'branch_id': branch_id, 
-            'start_date': start_date, 
-            'end_date': end_date
-        }
-        
-        if role_id:
-            query += ' AND e.role_id = :role_id'
-            params['role_id'] = role_id
-        
-        query += ' ORDER BY dr.report_date DESC, r.role_level, e.full_name'
-        
-        result = conn.execute(text(query), params)
-        return result.fetchall()
-    
-    @staticmethod
-    def get_company_reports(conn, company_id, start_date, end_date, branch_id=None, role_id=None):
-        """Get reports for all employees in a company within a date range.
-        
-        Args:
-            conn: Database connection
-            company_id: ID of the company
-            start_date: Start date for filtering
-            end_date: End date for filtering
-            branch_id: Optional branch ID for filtering
-            role_id: Optional role ID for filtering
-            
-        Returns:
-            List of reports with employee and branch info
-        """
-        query = '''
-        SELECT dr.id, e.full_name, r.role_name, b.branch_name, dr.report_date, dr.report_text, dr.created_at
-        FROM daily_reports dr
-        JOIN employees e ON dr.employee_id = e.id
-        JOIN branches b ON e.branch_id = b.id
-        JOIN employee_roles r ON e.role_id = r.id
-        WHERE b.company_id = :company_id
-        AND dr.report_date BETWEEN :start_date AND :end_date
-        '''
-        
-        params = {
-            'company_id': company_id, 
-            'start_date': start_date, 
-            'end_date': end_date
-        }
-        
-        if branch_id:
-            query += ' AND e.branch_id = :branch_id'
-            params['branch_id'] = branch_id
-        
-        if role_id:
-            query += ' AND e.role_id = :role_id'
-            params['role_id'] = role_id
-        
-        query += ' ORDER BY dr.report_date DESC, b.branch_name, r.role_level, e.full_name'
-        
-        result = conn.execute(text(query), params)
-        return result.fetchall()
-    
-    @staticmethod
-    def get_all_reports(conn, start_date, end_date, employee_name=None):
-        """Get all reports with optional employee filter.
-        
-        Args:
-            conn: Database connection
-            start_date: Start date for filtering
-            end_date: End date for filtering
-            employee_name: Optional employee name filter
-            
-        Returns:
-            List of reports with employee info
-        """
-        query = '''
-        SELECT e.full_name, dr.report_date, dr.report_text, dr.id, e.id as employee_id
-        FROM daily_reports dr
-        JOIN employees e ON dr.employee_id = e.id
-        WHERE dr.report_date BETWEEN :start_date AND :end_date
-        '''
-        
-        params = {'start_date': start_date, 'end_date': end_date}
-        
-        if employee_name and employee_name != "All Employees":
-            query += ' AND e.full_name = :employee_name'
-            params['employee_name'] = employee_name
-        
-        query += ' ORDER BY dr.report_date DESC, e.full_name'
-        
-        result = conn.execute(text(query), params)
-        return result.fetchall()
-    
-    @staticmethod
-    def add_report(conn, employee_id, report_date, report_text):
-        """Add a new report.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            report_date: Date of the report
-            report_text: Content of the report
-        """
-        conn.execute(text('''
-        INSERT INTO daily_reports (employee_id, report_date, report_text)
-        VALUES (:employee_id, :report_date, :report_text)
-        '''), {
-            'employee_id': employee_id,
-            'report_date': report_date,
-            'report_text': report_text
-        })
-        conn.commit()
-    
-    @staticmethod
-    def update_report(conn, report_id, report_date, report_text):
-        """Update an existing report.
-        
-        Args:
-            conn: Database connection
-            report_id: ID of the report
-            report_date: New date for the report
-            report_text: New content for the report
-        """
-        conn.execute(text('''
-        UPDATE daily_reports 
-        SET report_text = :report_text, report_date = :report_date, created_at = CURRENT_TIMESTAMP
-        WHERE id = :id
-        '''), {
-            'report_text': report_text,
-            'report_date': report_date,
-            'id': report_id
-        })
-        conn.commit()
-    
-    @staticmethod
-    def check_report_exists(conn, employee_id, report_date):
-        """Check if a report already exists for the given date.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            report_date: Date to check
-            
-        Returns:
-            Report ID if exists, None otherwise
-        """
-        result = conn.execute(text('''
-        SELECT id FROM daily_reports 
-        WHERE employee_id = :employee_id AND report_date = :report_date
-        '''), {'employee_id': employee_id, 'report_date': report_date})
-        return result.fetchone()
-
-
-class TaskModel:
-    """Task data operations with branch and employee assignment support"""
-    
-    @staticmethod
-    def create_task(conn, company_id, task_description, due_date, branch_id=None, employee_id=None):
-        """Create a new task with branch or employee assignment.
-        
-        Args:
-            conn: Database connection
-            company_id: ID of the company creating the task
-            task_description: Description of the task
-            due_date: Due date for the task
-            branch_id: Optional branch ID for branch-level assignment
-            employee_id: Optional employee ID for direct assignment
-            
-        Returns:
-            int: ID of the created task
-        """
-        with conn.begin():
-            # Insert task record
-            result = conn.execute(text('''
-            INSERT INTO tasks (company_id, branch_id, employee_id, task_description, due_date, is_completed)
-            VALUES (:company_id, :branch_id, :employee_id, :task_description, :due_date, FALSE)
-            RETURNING id
-            '''), {
-                'company_id': company_id,
-                'branch_id': branch_id,
-                'employee_id': employee_id,
-                'task_description': task_description,
-                'due_date': due_date
-            })
-            
-            task_id = result.fetchone()[0]
-            
-            # If assigned to a branch, create assignments for all branch employees
-            if branch_id and not employee_id:
-                # Get all active employees in the branch
-                employees = conn.execute(text('''
-                SELECT id FROM employees
-                WHERE branch_id = :branch_id AND is_active = TRUE
-                '''), {'branch_id': branch_id}).fetchall()
-                
-                # Create task assignments for each employee
-                for emp in employees:
-                    conn.execute(text('''
-                    INSERT INTO task_assignments (task_id, employee_id, is_completed)
-                    VALUES (:task_id, :employee_id, FALSE)
-                    '''), {
-                        'task_id': task_id,
-                        'employee_id': emp[0]
-                    })
-            
-            return task_id
-    
-    @staticmethod
-    def get_tasks_for_company(conn, company_id, status_filter=None):
-        """Get all tasks for a company with optional status filter.
-        
-        Args:
-            conn: Database connection
-            company_id: ID of the company
-            status_filter: Optional status filter ('All', 'Pending', 'Completed')
-            
-        Returns:
-            List of tasks with branch and employee info
-        """
-        query = '''
-        SELECT t.id, t.task_description, t.due_date, t.is_completed, 
-               t.completed_at, t.created_at, t.branch_id, t.employee_id,
-               CASE 
-                   WHEN t.branch_id IS NOT NULL THEN b.branch_name 
-                   WHEN t.employee_id IS NOT NULL THEN e.full_name
-                   ELSE 'Unassigned'
-               END as assignee_name,
-               CASE
-                   WHEN t.branch_id IS NOT NULL THEN 'branch'
-                   WHEN t.employee_id IS NOT NULL THEN 'employee'
-                   ELSE 'unassigned'
-               END as assignee_type,
-               ce.full_name as completed_by_name
-        FROM tasks t
-        LEFT JOIN branches b ON t.branch_id = b.id
-        LEFT JOIN employees e ON t.employee_id = e.id
-        LEFT JOIN employees ce ON t.completed_by_id = ce.id
-        WHERE t.company_id = :company_id
-        '''
-        
-        params = {'company_id': company_id}
-        
-        if status_filter == "Pending":
-            query += ' AND t.is_completed = FALSE'
-        elif status_filter == "Completed":
-            query += ' AND t.is_completed = TRUE'
-        
-        query += ' ORDER BY t.due_date ASC NULLS LAST, t.created_at DESC'
-        
-        result = conn.execute(text(query), params)
-        return result.fetchall()
-    
-    @staticmethod
-    def get_branch_task_progress(conn, task_id):
-        """Get progress of a branch-level task.
-        
-        Args:
-            conn: Database connection
-            task_id: ID of the task
-            
-        Returns:
-            Dict with total, completed counts and employee completion status
-        """
-        # Get task information
-        task_info = conn.execute(text('''
-        SELECT branch_id FROM tasks WHERE id = :task_id
-        '''), {'task_id': task_id}).fetchone()
-        
-        if not task_info or not task_info[0]:
-            return None  # Not a branch task
-        
-        # Get completion counts
-        counts = conn.execute(text('''
-        SELECT 
-            COUNT(*) as total,
-            SUM(CASE WHEN is_completed THEN 1 ELSE 0 END) as completed
-        FROM task_assignments
-        WHERE task_id = :task_id
-        '''), {'task_id': task_id}).fetchone()
-        
-        # Get individual employee statuses
-        employee_statuses = conn.execute(text('''
-        SELECT ta.employee_id, e.full_name, ta.is_completed, r.role_name, r.role_level,
-               ta.completed_at
-        FROM task_assignments ta
-        JOIN employees e ON ta.employee_id = e.id
-        JOIN employee_roles r ON e.role_id = r.id
-        WHERE ta.task_id = :task_id
-        ORDER BY r.role_level, e.full_name
-        '''), {'task_id': task_id}).fetchall()
-        
-        return {
-            'total': counts[0],
-            'completed': counts[1],
-            'employee_statuses': employee_statuses
-        }
-    
-    @staticmethod
-    def mark_task_completed(conn, task_id, employee_id):
-        """Mark a task as completed by an employee.
-        
-        For branch tasks, this marks the employee's assignment as completed.
-        For individual tasks, this marks the entire task as completed.
-        
-        Args:
-            conn: Database connection
-            task_id: ID of the task
-            employee_id: ID of the employee completing the task
-            
-        Returns:
-            bool: True if entire task is now complete, False otherwise
-        """
-        now = datetime.datetime.now()
-        
-        with conn.begin():
-            # Get task information
-            task = conn.execute(text('''
-            SELECT branch_id, employee_id, is_completed 
-            FROM tasks 
-            WHERE id = :task_id
-            '''), {'task_id': task_id}).fetchone()
-            
-            if not task:
-                return False
-            
-            # If already completed, do nothing
-            if task[2]:
-                return True
-            
-            # If branch task, update the employee's assignment
-            if task[0]:  # branch_id is not None
-                # Update the assignment
-                conn.execute(text('''
-                UPDATE task_assignments
-                SET is_completed = TRUE, completed_at = :now
-                WHERE task_id = :task_id AND employee_id = :employee_id
-                '''), {
-                    'task_id': task_id,
-                    'employee_id': employee_id,
-                    'now': now
-                })
-                
-                # Check employee role level
-                employee_role = conn.execute(text('''
-                SELECT r.role_level 
-                FROM employees e
-                JOIN employee_roles r ON e.role_id = r.id
-                WHERE e.id = :employee_id
-                '''), {'employee_id': employee_id}).fetchone()
-                
-                is_manager = employee_role and employee_role[0] <= 2  # Manager or Asst. Manager
-                
-                # If employee is a manager or assistant manager, complete the entire task
-                if is_manager:
-                    conn.execute(text('''
-                    UPDATE tasks
-                    SET is_completed = TRUE, completed_at = :now, completed_by_id = :employee_id
-                    WHERE id = :task_id
-                    '''), {
-                        'task_id': task_id,
-                        'employee_id': employee_id,
-                        'now': now
-                    })
-                    return True
-                
-                # Otherwise, check if all assignments are complete
-                all_complete = conn.execute(text('''
-                SELECT COUNT(*) = 0
-                FROM task_assignments
-                WHERE task_id = :task_id AND is_completed = FALSE
-                '''), {'task_id': task_id}).fetchone()[0]
-                
-                if all_complete:
-                    conn.execute(text('''
-                    UPDATE tasks
-                    SET is_completed = TRUE, completed_at = :now, completed_by_id = :employee_id
-                    WHERE id = :task_id
-                    '''), {
-                        'task_id': task_id,
-                        'employee_id': employee_id,
-                        'now': now
-                    })
-                    return True
-                
-                return False
-                
-            # If direct employee task, complete it
-            elif task[1] == employee_id:  # task assigned directly to this employee
-                conn.execute(text('''
-                UPDATE tasks
-                SET is_completed = TRUE, completed_at = :now, completed_by_id = :employee_id
-                WHERE id = :task_id
-                '''), {
-                    'task_id': task_id,
-                    'employee_id': employee_id,
-                    'now': now
-                })
-                return True
-            
-            return False
-    
-    @staticmethod
-    def get_tasks_for_employee(conn, employee_id, status_filter=None):
-        """Get tasks assigned to an employee.
-        
-        Includes both direct tasks and branch-level tasks.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            status_filter: Optional status filter ('All', 'Pending', 'Completed')
-            
-        Returns:
-            List of tasks with type and completion status
-        """
-        # Get employee's branch
-        emp_info = conn.execute(text('''
-        SELECT branch_id FROM employees WHERE id = :employee_id
-        '''), {'employee_id': employee_id}).fetchone()
-        
-        if not emp_info:
-            return []
-        
-        branch_id = emp_info[0]
-        
-        # Get directly assigned tasks
-        direct_query = '''
-        SELECT t.id, t.task_description, t.due_date, t.is_completed, 
-               t.completed_at, t.created_at, 'direct' as task_type,
-               NULL as assignment_id, t.is_completed as assignment_completed
-        FROM tasks t
-        WHERE t.employee_id = :employee_id
-        '''
-        
-        if status_filter == "Pending":
-            direct_query += ' AND t.is_completed = FALSE'
-        elif status_filter == "Completed":
-            direct_query += ' AND t.is_completed = TRUE'
-        
-        # Get branch-level tasks
-        branch_query = '''
-        SELECT t.id, t.task_description, t.due_date, t.is_completed, 
-               t.completed_at, t.created_at, 'branch' as task_type,
-               ta.id as assignment_id, ta.is_completed as assignment_completed
-        FROM tasks t
-        JOIN task_assignments ta ON t.id = ta.task_id
-        WHERE t.branch_id = :branch_id AND ta.employee_id = :employee_id
-        '''
-        
-        if status_filter == "Pending":
-            branch_query += ' AND ta.is_completed = FALSE'
-        elif status_filter == "Completed":
-            branch_query += ' AND ta.is_completed = TRUE'
-        
-        # Combine queries
-        query = f'''
-        {direct_query}
-        UNION ALL
-        {branch_query}
-        ORDER BY due_date ASC NULLS LAST, created_at DESC
-        '''
-        
-        result = conn.execute(text(query), {
-            'employee_id': employee_id,
-            'branch_id': branch_id
-        })
-        
-        return result.fetchall()
-    
-    @staticmethod
-    def reopen_task(conn, task_id):
-        """Reopen a completed task.
-        
-        Args:
-            conn: Database connection
-            task_id: ID of the task
-        """
-        with conn.begin():
-            # First reopen the main task
-            conn.execute(text('''
-            UPDATE tasks
-            SET is_completed = FALSE, completed_at = NULL, completed_by_id = NULL
-            WHERE id = :task_id
-            '''), {'task_id': task_id})
-            
-            # Then reopen all assignments
-            conn.execute(text('''
-            UPDATE task_assignments
-            SET is_completed = FALSE, completed_at = NULL
-            WHERE task_id = :task_id
-            '''), {'task_id': task_id})
-    
-    @staticmethod
-    def delete_task(conn, task_id):
-        """Delete a task and all its assignments.
-        
-        Args:
-            conn: Database connection
-            task_id: ID of the task
-        """
-        with conn.begin():
-            # First delete all assignments
-            conn.execute(text('''
-            DELETE FROM task_assignments
-            WHERE task_id = :task_id
-            '''), {'task_id': task_id})
-            
-            # Then delete the task
-            conn.execute(text('''
-            DELETE FROM tasks
-            WHERE id = :task_id
-            '''), {'task_id': task_id})
-    
-    @staticmethod
-    def add_task(conn, employee_id, task_description, due_date):
-        """Add a new task directly to an employee.
-        
-        Args:
-            conn: Database connection
-            employee_id: ID of the employee
-            task_description: Description of the task
-            due_date: Due date for the task
-        """
-        conn.execute(text('''
-        INSERT INTO tasks (employee_id, task_description, due_date, is_completed)
-        VALUES (:employee_id, :task_description, :due_date, FALSE)
-        '''), {
-            'employee_id': employee_id,
-            'task_description': task_description,
-            'due_date': due_date
-        })
-        conn.commit()
-    
-    @staticmethod
-    def update_task_status(conn, task_id, is_completed):
-        """Update a task's completion status.
-        
-        Args:
-            conn: Database connection
-            task_id: ID of the task
-            is_completed: New completion status
-        """
-        conn.execute(text('''
-        UPDATE tasks SET is_completed = :is_completed WHERE id = :id
-        '''), {'id': task_id, 'is_completed': is_completed})
-        conn.commit()
-
-
-#########################################
-# UTILITY FUNCTIONS
-#########################################
-
-class RolePermissions:
-    """Define role-based permissions and access controls"""
-    
-    # Role level definitions (lower number = higher authority)
-    MANAGER = 1
-    ASST_MANAGER = 2
-    GENERAL_EMPLOYEE = 3
-    
-    @staticmethod
-    def get_role_level(role_name):
-        """Convert role name to role level."""
-        role_map = {
-            "Manager": RolePermissions.MANAGER,
-            "Asst. Manager": RolePermissions.ASST_MANAGER,
-            "General Employee": RolePermissions.GENERAL_EMPLOYEE
-        }
-        return role_map.get(role_name, RolePermissions.GENERAL_EMPLOYEE)
-    
-    @staticmethod
-    def get_role_name(role_level):
-        """Convert role level to role name."""
-        role_map = {
-            RolePermissions.MANAGER: "Manager",
-            RolePermissions.ASST_MANAGER: "Asst. Manager",
-            RolePermissions.GENERAL_EMPLOYEE: "General Employee"
-        }
-        return role_map.get(role_level, "General Employee")
-    
-    @staticmethod
-    def can_create_employees(user_role_level):
-        """Check if the role can create employee accounts."""
-        return user_role_level <= RolePermissions.ASST_MANAGER  # Manager and Asst. Manager can create
-    
-    @staticmethod
-    def can_assign_tasks_to(user_role_level, target_role_level):
-        """Check if user role can assign tasks to target role."""
-        if user_role_level == RolePermissions.MANAGER:
-            # Manager can assign to Asst. Manager and General Employee
-            return target_role_level >= RolePermissions.ASST_MANAGER
-        elif user_role_level == RolePermissions.ASST_MANAGER:
-            # Asst. Manager can only assign to General Employee
-            return target_role_level == RolePermissions.GENERAL_EMPLOYEE
-        else:
-            # General Employee cannot assign tasks
-            return False
-    
-    @staticmethod
-    def can_view_reports_of(user_role_level, target_role_level):
-        """Check if user role can view reports from target role."""
-        if user_role_level == RolePermissions.MANAGER:
-            # Manager can view all reports in their branch
-            return True
-        elif user_role_level == RolePermissions.ASST_MANAGER:
-            # Asst. Manager can view their own and General Employee reports
-            return target_role_level >= RolePermissions.ASST_MANAGER
-        else:
-            # General Employee can only view their own reports
-            return user_role_level == target_role_level
-    
-    @staticmethod
-    def can_deactivate_role(user_role_level, target_role_level):
-        """Check if user role can deactivate/reactivate target role."""
-        if user_role_level == RolePermissions.MANAGER:
-            # Manager can deactivate Asst. Manager and General Employee
-            return target_role_level > user_role_level
-        elif user_role_level == RolePermissions.ASST_MANAGER:
-            # Asst. Manager can only deactivate General Employees
-            return target_role_level == RolePermissions.GENERAL_EMPLOYEE
-        else:
-            # General Employee cannot deactivate anyone
-            return False
-
-
-def get_date_range_from_filter(date_filter):
-    """Get start and end dates based on a date filter selection.
-    
-    Args:
-        date_filter: String representing the selected date range
-        
-    Returns:
-        tuple: (start_date, end_date)
-    """
-    today = datetime.date.today()
-    
-    if date_filter == "Today":
-        start_date = today
-        end_date = today
-    elif date_filter == "This Week":
-        start_date = today - datetime.timedelta(days=today.weekday())
-        end_date = today
-    elif date_filter == "This Month":
-        start_date = today.replace(day=1)
-        end_date = today
-    elif date_filter == "This Year":
-        start_date = today.replace(month=1, day=1)
-        end_date = today
-    else:  # All Time/Reports
-        start_date = datetime.date(2000, 1, 1)
-        end_date = today
-    
-    return start_date, end_date
-
-
-def format_timestamp(timestamp, format_str='%d %b, %Y'):
-    """Format a timestamp into a readable string.
-    
-    Args:
-        timestamp: Datetime object
-        format_str: Format string (default: '%d %b, %Y')
-        
-    Returns:
-        str: Formatted date string or "No date" if None
-    """
-    if timestamp:
-        return timestamp.strftime(format_str)
-    return "No due date"
-
-
-def calculate_completion_rate(total, completed):
-    """Calculate the completion rate as a percentage.
-    
-    Args:
-        total: Total number of items
-        completed: Number of completed items
-        
-    Returns:
-        int: Completion rate percentage
-    """
-    if total == 0:
-        return 0
-    return round((completed / total) * 100)
-
-
-def authenticate(engine, username, password):
-    """Authenticate a user based on username and password.
-    
-    Args:
-        engine: SQLAlchemy database engine
-        username: User's username
-        password: User's password
-        
-    Returns:
-        dict: User information if authentication succeeds, None otherwise
-    """
-    # Check if admin credentials are properly set in Streamlit secrets
-    if "admin_username" not in st.secrets or "admin_password" not in st.secrets:
-        st.warning("Admin credentials are not properly configured in Streamlit secrets. Please set admin_username and admin_password in .streamlit/secrets.toml")
-        return None
-    
-    # Check if credentials match admin in Streamlit secrets
-    admin_username = st.secrets["admin_username"]
-    admin_password = st.secrets["admin_password"]
-    
-    if username == admin_username and password == admin_password:
-        return {
-            "id": 0,  # Special ID for admin
-            "username": username, 
-            "full_name": "Administrator", 
-            "user_type": "admin",
-            "profile_pic_url": "https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y"
-        }
-    
-    # If not admin, check company credentials
-    with engine.connect() as conn:
-        result = conn.execute(text('''
-        SELECT id, company_name, username, profile_pic_url
-        FROM companies
-        WHERE username = :username AND password = :password AND is_active = TRUE
-        '''), {'username': username, 'password': password})
-        company = result.fetchone()
-    
-    if company:
-        return {
-            "id": company[0], 
-            "username": company[2], 
-            "full_name": company[1], 
-            "user_type": "company",
-            "profile_pic_url": company[3]
-        }
-    
-    # If not company, check employee credentials with role information
-    with engine.connect() as conn:
-        result = conn.execute(text('''
-        SELECT e.id, e.username, e.full_name, e.profile_pic_url, 
-               b.id as branch_id, b.branch_name, c.id as company_id, c.company_name,
-               r.id as role_id, r.role_name, r.role_level
-        FROM employees e
-        JOIN branches b ON e.branch_id = b.id
-        JOIN companies c ON b.company_id = c.id
-        JOIN employee_roles r ON e.role_id = r.id
-        WHERE e.username = :username AND e.password = :password 
-          AND e.is_active = TRUE AND b.is_active = TRUE AND c.is_active = TRUE
-        '''), {'username': username, 'password': password})
-        employee = result.fetchone()
-    
-    if employee:
-        return {
-            "id": employee[0], 
-            "username": employee[1], 
-            "full_name": employee[2],
-            "user_type": "employee",
-            "profile_pic_url": employee[3],
-            "branch_id": employee[4],
-            "branch_name": employee[5],
-            "company_id": employee[6],
-            "company_name": employee[7],
-            "role_id": employee[8],
-            "role_name": employee[9],
-            "role_level": employee[10]
-        }
-    
-    return None
-
-
-def logout():
-    """Log out the current user by clearing session state."""
-    st.session_state.pop("user", None)
-    st.rerun()
-
-
-def get_custom_css():
-    """Return the custom CSS for better UI styling.
-    
-    Returns:
-        str: CSS styles as a string
-    """
-    return """
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: 700;
-        color: #1E88E5;
-        margin-bottom: 1rem;
-        text-align: center;
-    }
-    
-    .sub-header {
-        font-size: 1.8rem;
-        font-weight: 600;
-        color: #333;
-        margin-bottom: 1rem;
-    }
-    
-    .card {
-        background-color: #f8f9fa;
-        border-radius: 10px;
-        padding: 1.5rem;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        margin-bottom: 1rem;
-    }
-    
-    .stat-card {
-        background-color: #ffffff;
-        border-radius: 8px;
-        padding: 1rem;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-        text-align: center;
-    }
-    
-    .stat-value {
-        font-size: 2rem;
-        font-weight: 700;
-        color: #1E88E5;
-    }
-    
-    .stat-label {
-        font-size: 1rem;
-        color: #777;
-    }
-    
-    .login-container {
-        max-width: 400px;
-        margin: 0 auto;
-        padding: 2.5rem;
-    }
-    
-    .login-header {
-        text-align: center;
-        margin-bottom: 1.5rem;
-    }
-    
-    .stButton > button {
-        width: 100%;
-        background-color: #1E88E5;
-        color: white;
-        font-weight: 600;
-        height: 2.5rem;
-        border-radius: 5px;
-    }
-    
-    .stTextInput > div > div > input {
-        height: 2.5rem;
-    }
-    
-    .report-item {
-        background-color: #f1f7fe;
-        padding: 1rem;
-        border-radius: 8px;
-        margin-bottom: 0.5rem;
-        border-left: 4px solid #1E88E5;
-    }
-    
-    .task-item {
-        background-color: #f1fff1;
-        padding: 1rem;
-        border-radius: 8px;
-        margin-bottom: 0.5rem;
-        border-left: 4px solid #4CAF50;
-    }
-    
-    .task-item.completed {
-        background-color: #f0f0f0;
-        border-left: 4px solid #9e9e9e;
-    }
-    
-    .profile-container {
-        display: flex;
-        align-items: center;
-        gap: 1rem;
-        margin-bottom: 1.5rem;
-    }
-    
-    .profile-image {
-        width: 80px;
-        height: 80px;
-        border-radius: 50%;
-        object-fit: cover;
-        border: 3px solid #1E88E5;
-    }
-</style>
-"""
-
-
-def create_employee_report_pdf(reports, employee_name=None):
-    """Generate a PDF report for employee daily reports.
-    
-    Args:
-        reports: List of report data tuples (id, date, text)
-        employee_name: Name of the employee (optional)
-        
-    Returns:
-        bytes: PDF content as bytes
-    """
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
-    styles = getSampleStyleSheet()
-    elements = []
-    
-    # Title
-    title_style = ParagraphStyle(
-        'Title',
-        parent=styles['Heading1'],
-        fontSize=16,
-        alignment=1,
-        spaceAfter=12
-    )
-    title = f"Work Reports: {employee_name}" if employee_name else "Work Reports"
-    elements.append(Paragraph(title, title_style))
-    elements.append(Spacer(1, 12))
-    
-    # Date range
-    if reports:
-        date_style = ParagraphStyle(
-            'DateRange',
-            parent=styles['Normal'],
-            fontSize=10,
-            alignment=1,
-            textColor=colors.gray
-        )
-        min_date = min(report[1] for report in reports).strftime('%d %b %Y')
-        max_date = max(report[1] for report in reports).strftime('%d %b %Y')
-        elements.append(Paragraph(f"Period: {min_date} to {max_date}", date_style))
-        elements.append(Spacer(1, 20))
-    
-    # Group reports by month
-    reports_by_month = {}
-    for report in reports:
-        month_year = report[1].strftime('%B %Y')
-        if month_year not in reports_by_month:
-            reports_by_month[month_year] = []
-        reports_by_month[month_year].append(report)
-    
-    # Add each month's reports
-    for month, month_reports in reports_by_month.items():
-        # Month header
-        month_style = ParagraphStyle(
-            'Month',
-            parent=styles['Heading2'],
-            fontSize=14,
-            spaceAfter=10
-        )
-        elements.append(Paragraph(month, month_style))
-        
-        # Reports for the month
-        for report in month_reports:
-            # Date
-            date_style = ParagraphStyle(
-                'Date',
-                parent=styles['Normal'],
-                fontSize=11,
-                textColor=colors.blue
-            )
-            elements.append(Paragraph(report[1].strftime('%A, %d %b %Y'), date_style))
-            
-            # Report text
-            text_style = ParagraphStyle(
-                'ReportText',
-                parent=styles['Normal'],
-                fontSize=10,
-                leftIndent=10
-            )
-            elements.append(Paragraph(report[2], text_style))
-            elements.append(Spacer(1, 12))
-        
-        elements.append(Spacer(1, 10))
-    
-    # Build PDF
-    doc.build(elements)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def create_branch_report_pdf(reports, branch_name):
-    """Generate a PDF report for all employees in a branch.
-    
-    Args:
-        reports: List of report data tuples (id, employee_name, role, date, text, created_at)
-        branch_name: Name of the branch
-        
-    Returns:
-        bytes: PDF content as bytes
-    """
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
-    styles = getSampleStyleSheet()
-    elements = []
-    
-    # Title
-    title_style = ParagraphStyle(
-        'Title',
-        parent=styles['Heading1'],
-        fontSize=16,
-        alignment=1,
-        spaceAfter=12
-    )
-    elements.append(Paragraph(f"Branch Reports: {branch_name}", title_style))
-    elements.append(Spacer(1, 12))
-    
-    # Date range
-    if reports:
-        date_style = ParagraphStyle(
-            'DateRange',
-            parent=styles['Normal'],
-            fontSize=10,
-            alignment=1,
-            textColor=colors.gray
-        )
-        min_date = min(report[3] for report in reports).strftime('%d %b %Y')
-        max_date = max(report[3] for report in reports).strftime('%d %b %Y')
-        elements.append(Paragraph(f"Period: {min_date} to {max_date}", date_style))
-        elements.append(Spacer(1, 20))
-    
-    # Group reports by employee and date
-    reports_by_employee = {}
-    for report in reports:
-        employee_name = report[1]
-        role_name = report[2]
-        
-        key = f"{employee_name} ({role_name})"
-        if key not in reports_by_employee:
-            reports_by_employee[key] = []
-        
-        reports_by_employee[key].append(report)
-    
-    # Add each employee's reports
-    for employee, emp_reports in reports_by_employee.items():
-        # Employee header
-        emp_style = ParagraphStyle(
-            'Employee',
-            parent=styles['Heading2'],
-            fontSize=14,
-            spaceAfter=10
-        )
-        elements.append(Paragraph(employee, emp_style))
-        
-        # Group by date
-        for report in emp_reports:
-            # Date
-            date_style = ParagraphStyle(
-                'Date',
-                parent=styles['Normal'],
-                fontSize=11,
-                textColor=colors.blue
-            )
-            elements.append(Paragraph(report[3].strftime('%A, %d %b %Y'), date_style))
-            
-            # Report text
-            text_style = ParagraphStyle(
-                'ReportText',
-                parent=styles['Normal'],
-                fontSize=10,
-                leftIndent=10
-            )
-            elements.append(Paragraph(report[4], text_style))
-            elements.append(Spacer(1, 12))
-        
-        elements.append(Spacer(1, 15))
-    
-    # Build PDF
-    doc.build(elements)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def create_company_report_pdf(reports, company_name):
-    """Generate a PDF report for all branches in a company.
-    
-    Args:
-        reports: List of report data tuples (id, employee_name, role, branch_name, date, text, created_at)
-        company_name: Name of the company
-        
-    Returns:
-        bytes: PDF content as bytes
-    """
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, leftMargin=0.5*inch, rightMargin=0.5*inch)
-    styles = getSampleStyleSheet()
-    elements = []
-    
-    # Title
-    title_style = ParagraphStyle(
-        'Title',
-        parent=styles['Heading1'],
-        fontSize=16,
-        alignment=1,
-        spaceAfter=12
-    )
-    elements.append(Paragraph(f"Company Reports: {company_name}", title_style))
-    elements.append(Spacer(1, 12))
-    
-    # Date range
-    if reports:
-        date_style = ParagraphStyle(
-            'DateRange',
-            parent=styles['Normal'],
-            fontSize=10,
-            alignment=1,
-            textColor=colors.gray
-        )
-        min_date = min(report[4] for report in reports).strftime('%d %b %Y')
-        max_date = max(report[4] for report in reports).strftime('%d %b %Y')
-        elements.append(Paragraph(f"Period: {min_date} to {max_date}", date_style))
-        elements.append(Spacer(1, 20))
-    
-    # Group reports by branch, then by employee
-    reports_by_branch = {}
-    for report in reports:
-        branch_name = report[3]
-        
-        if branch_name not in reports_by_branch:
-            reports_by_branch[branch_name] = {}
-        
-        employee_name = report[1]
-        role_name = report[2]
-        key = f"{employee_name} ({role_name})"
-        
-        if key not in reports_by_branch[branch_name]:
-            reports_by_branch[branch_name][key] = []
-        
-        reports_by_branch[branch_name][key].append(report)
-    
-    # Add each branch's reports
-    for branch_name, employees in reports_by_branch.items():
-        # Branch header
-        branch_style = ParagraphStyle(
-            'Branch',
-            parent=styles['Heading2'],
-            fontSize=16,
-            spaceAfter=10,
-            textColor=colors.blue
-        )
-        elements.append(Paragraph(f"Branch: {branch_name}", branch_style))
-        
-        # For each employee in the branch
-        for employee_name, emp_reports in employees.items():
-            # Employee header
-            emp_style = ParagraphStyle(
-                'Employee',
-                parent=styles['Heading3'],
-                fontSize=14,
-                spaceAfter=8
-            )
-            elements.append(Paragraph(employee_name, emp_style))
-            
-            # Group by date
-            emp_reports_by_date = {}
-            for report in emp_reports:
-                date_str = report[4].strftime('%Y-%m-%d')
-                if date_str not in emp_reports_by_date:
-                    emp_reports_by_date[date_str] = report
-            
-            # Add each report
-            for date_str, report in sorted(emp_reports_by_date.items(), reverse=True):
-                # Date
-                date_style = ParagraphStyle(
-                    'Date',
-                    parent=styles['Normal'],
-                    fontSize=11,
-                    textColor=colors.darkblue
-                )
-                elements.append(Paragraph(report[4].strftime('%A, %d %b %Y'), date_style))
-                
-                # Report text
-                text_style = ParagraphStyle(
-                    'ReportText',
-                    parent=styles['Normal'],
-                    fontSize=10,
-                    leftIndent=10
-                )
-                elements.append(Paragraph(report[5], text_style))
-                elements.append(Spacer(1, 10))
-            
-            elements.append(Spacer(1, 10))
-        
-        elements.append(Spacer(1, 20))
-    
-    # Build PDF
-    doc.build(elements)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def create_role_report_pdf(reports, role_name, company_name):
-    """Generate a PDF report for all employees of a specific role.
-    
-    Args:
-        reports: List of report data tuples with employee and branch info
-        role_name: Name of the role
-        company_name: Name of the company
-        
-    Returns:
-        bytes: PDF content as bytes
-    """
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
-    styles = getSampleStyleSheet()
-    elements = []
-    
-    # Title
-    title_style = ParagraphStyle(
-        'Title',
-        parent=styles['Heading1'],
-        fontSize=16,
-        alignment=1,
-        spaceAfter=12
-    )
-    elements.append(Paragraph(f"{role_name} Reports - {company_name}", title_style))
-    elements.append(Spacer(1, 12))
-    
-    # Date range
-    if reports:
-        date_style = ParagraphStyle(
-            'DateRange',
-            parent=styles['Normal'],
-            fontSize=10,
-            alignment=1,
-            textColor=colors.gray
-        )
-        min_date = min(report[4] for report in reports).strftime('%d %b %Y')
-        max_date = max(report[4] for report in reports).strftime('%d %b %Y')
-        elements.append(Paragraph(f"Period: {min_date} to {max_date}", date_style))
-        elements.append(Spacer(1, 20))
-    
-    # Group reports by employee and branch
-    reports_by_employee = {}
-    for report in reports:
-        employee_name = report[1]
-        branch_name = report[3]
-        
-        key = f"{employee_name} ({branch_name})"
-        if key not in reports_by_employee:
-            reports_by_employee[key] = []
-        
-        reports_by_employee[key].append(report)
-    
-    # Add each employee's reports
-    for employee, emp_reports in reports_by_employee.items():
-        # Employee header
-        emp_style = ParagraphStyle(
-            'Employee',
-            parent=styles['Heading2'],
-            fontSize=14,
-            spaceAfter=10
-        )
-        elements.append(Paragraph(employee, emp_style))
-        
-        # Group by date
-        emp_reports_by_date = {}
-        for report in emp_reports:
-            date_str = report[4].strftime('%Y-%m-%d')
-            if date_str not in emp_reports_by_date:
-                emp_reports_by_date[date_str] = report
-        
-        # Add each report
-        for date_str, report in sorted(emp_reports_by_date.items(), reverse=True):
-            # Date
-            date_style = ParagraphStyle(
-                'Date',
-                parent=styles['Normal'],
-                fontSize=11,
-                textColor=colors.blue
-            )
-            elements.append(Paragraph(report[4].strftime('%A, %d %b %Y'), date_style))
-            
-            # Report text
-            text_style = ParagraphStyle(
-                'ReportText',
-                parent=styles['Normal'],
-                fontSize=10,
-                leftIndent=10
-            )
-            elements.append(Paragraph(report[5], text_style))
-            elements.append(Spacer(1, 10))
-        
-        elements.append(Spacer(1, 15))
-    
-    # Build PDF
-    doc.build(elements)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-#########################################
-# UI COMPONENTS
-#########################################
-
-def display_profile_header(user):
-    """Display user profile header with image and name.
-    
-    Args:
-        user: User dict with profile information
-    """
-    col1, col2, col3 = st.columns([1, 3, 1])
-    with col2:
-        st.markdown('<div class="profile-container">', unsafe_allow_html=True)
-        try:
-            st.image(user["profile_pic_url"], width=80, clamp=True, output_format="auto", 
-                    channels="RGB", use_container_width=False)
-        except:
-            st.image("https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&f=y", 
-                    width=80, use_container_width=False)
-        
-        user_type = "Administrator" if user.get("is_admin", False) else "Employee"
-        st.markdown(f'''
-        <div>
-            <h3>{user["full_name"]}</h3>
-            <p>{user_type}</p>
-        </div>
-        ''', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-
-def display_stats_card(value, label):
-    """Display a statistics card with value and label.
-    
-    Args:
-        value: The statistic value to display
-        label: The label for the statistic
-    """
-    st.markdown('<div class="stat-card">', unsafe_allow_html=True)
-    st.markdown(f'<div class="stat-value">{value}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="stat-label">{label}</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+            for message in recent_messages
